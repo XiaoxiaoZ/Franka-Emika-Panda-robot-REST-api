@@ -57,9 +57,4 @@ This project provides a RESTful API for controlling the Franka Emika Panda robot
 
 ## Notes
 
-- The API must be run in an environment with ROS and the Franka robot interface available.
-- Error messages from ROS are collected and returned on failed executions.
-
----
-
-**For development and debugging, set `debug=True
+- The API must be run in an environment with ROS/moveit and the Franka robot interface available.
