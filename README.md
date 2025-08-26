@@ -5,10 +5,10 @@ This project provides a RESTful API for controlling the Franka Emika Panda robot
 ## Features
 
 - **Simulation Control**
-  - Add, remove, attach, and detach a box in the simulation.
+  - Add, remove, attach, and detach a box in the simulation for path planning. 
 - **Robot Control**
   - Move the gripper to a specified width.
-  - Plan and execute Cartesian and joint paths.
+  - Plan and execute Cartesian or joint paths.
 
 ## Endpoints
 
@@ -46,7 +46,7 @@ This project provides a RESTful API for controlling the Franka Emika Panda robot
    ```
 3. **Test endpoints:**
    ```bash
-   curl "http://127.0.0.1:5000/control/go_to_gripper_state?width=0.04"
+   curl "http://127.0.0.1:5000/control/go_to_gripper_state?width=0.01"
    ```
 
 ## Requirements
