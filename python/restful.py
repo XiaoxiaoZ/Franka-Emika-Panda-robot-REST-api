@@ -37,6 +37,31 @@ def home():
         data = "Hello, this is Franka Emika Panda"
         return jsonify({'data': data})
     
+@app.route('/state', methods = ['GET'])
+def get_state():
+    pose = robot.move_group.get_current_pose()
+    gripper_width = robot.hand_group.get_current_joint_values()[0]
+    #print("gripper_width:",gripper_width)
+    if gripper_width>0.035:
+        gripper = 1 # open
+    else:
+        gripper = 0 # close
+    state_dict = {
+        "position": {
+            "x": pose.pose.position.x,
+            "y": pose.pose.position.y,
+            "z": pose.pose.position.z
+        },
+        "orientation": {
+            "x": pose.pose.orientation.x,
+            "y": pose.pose.orientation.y,
+            "z": pose.pose.orientation.z,
+            "w": pose.pose.orientation.w
+        },
+        "gripper": gripper 
+    }
+    return jsonify(state_dict), 200
+    
 @app.route('/simulation/remove_box', methods = ['GET'])
 def remove_box():
     robot.remove_box()
@@ -79,12 +104,27 @@ def gripper_open():
         result = robot.go_to_gripper_state(0.1)
         return jsonify({'result': result}), 200
     except Exception as error:
-        return jsonify({'error': error}), 500    
+        return jsonify({'error': error}), 500   
+
+def gripper_close():
+    try:
+        result = robot.go_to_gripper_state(0.01)
+        return jsonify({'result': result}), 200
+    except Exception as error:
+        return jsonify({'error': error}), 500   
+     
 @app.route('/control/gripper_open', methods = ['GET'])
 def gripper_open_impl():
     if not moveit_lock.acquire(blocking=False):
         return jsonify({"error": "Robot is busy"}), 409
     try: return gripper_open()
+    finally: moveit_lock.release()
+
+@app.route('/control/gripper_close', methods = ['GET'])
+def gripper_close_impl():
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try: return gripper_close()
     finally: moveit_lock.release()
 
 def plan_cartesian_path():

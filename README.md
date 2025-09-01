@@ -12,6 +12,26 @@ This project provides a RESTful API for controlling the Franka Emika Panda robot
 
 ## Endpoints
 
+###
+
+- `GET /state`
+  Get robot state. Gripper 1 is open, 0 is closed.
+  Example state:
+    {
+    "gripper": 1,
+    "orientation": {
+      "w": 0.00028813095071412737,
+      "x": -0.9999999068105678,
+      "y": -9.515382186451469e-05,
+      "z": -0.00030709145380621787
+    },
+    "position": {
+      "x": 0.5000186889335273,
+      "y": 0.3999107757901367,
+      "z": 0.220021696649158
+    }
+  }
+
 ### Simulation
 
 - `GET /simulation/add_box`  
@@ -33,6 +53,9 @@ This project provides a RESTful API for controlling the Franka Emika Panda robot
   
 - `GET /control/gripper_open`  
   Make gripper open.
+
+- `GET /control/gripper_close`  
+  Make gripper close.
 
 - `GET /control/plan_cartesian_path?x=<float>&y=<float>&z=<float>`  
   Plans and executes a Cartesian path.
