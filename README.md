@@ -30,12 +30,18 @@ This project provides a RESTful API for controlling the Franka Emika Panda robot
 
 - `GET /control/go_to_gripper_state?width=<float>`  
   Moves the gripper to the specified width.
+  
+- `GET /control/gripper_open`  
+  Make gripper open.
 
 - `GET /control/plan_cartesian_path?x=<float>&y=<float>&z=<float>`  
   Plans and executes a Cartesian path.
 
 - `GET /control/plan_joint_path?x=<float>&y=<float>&z=<float>`  
   Plans and executes a joint path.
+
+- `GET /control/stop`  
+  Stop the ongoing execution of the robot and clean the path planned.
 
 ## Usage
 
