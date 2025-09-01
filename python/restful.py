@@ -1,11 +1,14 @@
 # Using flask to make an api
 # import necessary libraries and functions
 from flask import Flask, jsonify, request
+from threading import Lock
 
 # Log
 from franka import MoveGroupPythonInterfaceTutorial
 import rospy
 from rosgraph_msgs.msg import Log
+
+
 
 last_error = []
 def rosout_cd(msg):
@@ -19,6 +22,8 @@ app = Flask(__name__)
 
 # robot instance
 robot = MoveGroupPythonInterfaceTutorial()
+# Thread lock
+moveit_lock = Lock()
 
 robot.add_floor()
 
@@ -52,7 +57,6 @@ def attach_box():
     robot.attach_box()
     return jsonify({'msg': "box attached on the tool"})
     
-@app.route('/control/go_to_gripper_state', methods = ['GET'])
 def go_to_gripper_state():
     try:
         width = float(request.args.get("width"))
@@ -63,8 +67,13 @@ def go_to_gripper_state():
         return jsonify({'result': result})
     except Exception as error:
         return jsonify({'error': error})      
+@app.route('/control/go_to_gripper_state', methods = ['GET'])
+def go_to_gripper_state_impl():
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try: return go_to_gripper_state()
+    finally: moveit_lock.release()
 
-@app.route('/control/plan_cartesian_path', methods = ['GET'])
 def plan_cartesian_path():
     try:
         x = float(request.args.get("x"))
@@ -84,8 +93,13 @@ def plan_cartesian_path():
         if not success:
             return jsonify({"error": last_error or "Exception failed"})
         return jsonify({"msg": "Plan 100%", "result": str(result)})
+@app.route('/control/plan_cartesian_path', methods = ['GET'])
+def plan_cartesian_path_impl():
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try: return plan_cartesian_path()
+    finally: moveit_lock.release()
     
-@app.route('/control/plan_joint_path', methods = ['GET'])
 def plan_joint_path():
     try:
         x = float(request.args.get("x"))
@@ -102,8 +116,17 @@ def plan_joint_path():
     if not success:
         return jsonify({"error": last_error or "Exception failed"})
     return jsonify({"msg": "Plan 100%", "planning_time": str(planning_time)})
+@app.route('/control/plan_joint_path', methods = ['GET'])
+def plan_joint_path_impl():
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try: return plan_joint_path()
+    finally: moveit_lock.release()
 
-
+@app.route('/control/stop', methods = ['GET'])
+def stop():
+    robot.stop()
+    return jsonify({"msg": "Robot stopped"})
 # driver function
 if __name__ == '__main__':
-    app.run(debug = True, threaded=False)
+    app.run(debug = True)

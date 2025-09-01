@@ -621,7 +621,11 @@ class MoveGroupPythonInterfaceTutorial(object):
         return self.wait_for_state_update(
             box_is_attached=False, box_is_known=False, timeout=timeout
         )
-
+    def stop(self):
+        move_group = self.move_group
+        move_group.stop()
+        move_group.clear_pose_targets()
+        return True
 
 def main():
     try:
