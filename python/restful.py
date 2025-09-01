@@ -142,4 +142,4 @@ def stop():
     return jsonify({"status": "stopped","msg": "Robot stopped"}), 200
 # driver function
 if __name__ == '__main__':
-    app.run(debug = True)
+    app.run(host="172.26.0.162", port=5000, debug = True)
