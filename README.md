@@ -16,7 +16,8 @@ This project provides a RESTful API for controlling the Franka Emika Panda robot
 
 - `GET /state`
   Get robot state. Gripper 1 is open, 0 is closed.
-  Example state:
+  Example response:
+  ```json
     {
     "gripper": 1,
     "orientation": {
