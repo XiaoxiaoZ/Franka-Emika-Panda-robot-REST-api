@@ -8,6 +8,8 @@ from franka import MoveGroupPythonInterfaceTutorial
 import rospy
 from rosgraph_msgs.msg import Log
 
+import actionlib
+from franka_gripper.msg import MoveAction, MoveGoal, GraspAction, GraspGoal
 
 
 last_error = []
@@ -22,9 +24,20 @@ app = Flask(__name__)
 
 # robot instance
 robot = MoveGroupPythonInterfaceTutorial()
+
 # Thread lock
 moveit_lock = Lock()
 
+# ----- Franka gripper action clients -----
+gripper_move_client = actionlib.SimpleActionClient('/franka_gripper/move', MoveAction)
+gripper_grasp_client = actionlib.SimpleActionClient('/franka_gripper/grasp', GraspAction)
+
+rospy.loginfo("Waiting for franka_gripper action servers...")
+if not gripper_move_client.wait_for_server(rospy.Duration(10.0)):
+    rospy.logerr("franka_gripper/move action server not available after 10s")
+if not gripper_grasp_client.wait_for_server(rospy.Duration(10.0)):
+    rospy.logerr("franka_gripper/grasp action server not available after 10s")
+rospy.loginfo("franka_gripper action servers are ready (or timed out).")
 robot.add_floor()
 
 # on the terminal type: curl http://127.0.0.1:5000/
@@ -112,6 +125,76 @@ def gripper_close():
         return jsonify({'result': result}), 200
     except Exception as error:
         return jsonify({'error': error}), 500   
+    
+def gripper_open1():
+    """
+    Open the gripper using franka_gripper/move.
+    Optional query params:
+      width: target opening in meters (default 0.08)
+      speed: opening speed in m/s (default 0.1)
+    """
+    try:
+        width = float(request.args.get("width", "0.08"))  # Panda max ≈ 0.08 m
+        speed = float(request.args.get("speed", "0.1"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Bad width/speed params"}), 400
+
+    goal = MoveGoal()
+    goal.width = width
+    goal.speed = speed
+
+    try:
+        gripper_move_client.send_goal(goal)
+        gripper_move_client.wait_for_result()
+        result = gripper_move_client.get_result()
+    except Exception as e:
+        return jsonify({"error": f"franka_gripper move failed: {e}"}), 500
+
+    return jsonify({
+        "success": bool(getattr(result, "success", True)),
+        "final_width_cmd": float(width)
+    }), 200
+
+
+def gripper_close1():
+    """
+    Close the gripper until it senses an object, using franka_gripper/grasp.
+
+    Optional query params:
+      width: expected object width (m). Use 0.0 if unknown (close fully until contact)
+      speed: closing speed (m/s, default 0.05)
+      force: grip force (N, default 20.0)
+      eps_in: epsilon.inner, allowed inner tolerance (default 0.005)
+      eps_out: epsilon.outer, allowed outer tolerance (default 0.005)
+    """
+    try:
+        width = float(request.args.get("width", "0.0"))
+        speed = float(request.args.get("speed", "0.05"))
+        force = float(request.args.get("force", "20.0"))
+        eps_in = float(request.args.get("eps_in", "0.005"))
+        eps_out = float(request.args.get("eps_out", "0.005"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Bad grasp params"}), 400
+
+    goal = GraspGoal()
+    goal.width = width
+    goal.speed = speed
+    goal.force = force
+    goal.epsilon.inner = eps_in
+    goal.epsilon.outer = eps_out
+
+    try:
+        gripper_grasp_client.send_goal(goal)
+        gripper_grasp_client.wait_for_result()
+        result = gripper_grasp_client.get_result()
+    except Exception as e:
+        return jsonify({"error": f"franka_gripper grasp failed: {e}"}), 500
+
+    return jsonify({
+        "success": bool(getattr(result, "success", True)),
+        "used_width_cmd": float(width),
+        "force": float(force)
+    }), 200
      
 @app.route('/control/gripper_open', methods = ['GET'])
 def gripper_open_impl():
@@ -182,4 +265,4 @@ def stop():
     return jsonify({"status": "stopped","msg": "Robot stopped"}), 200
 # driver function
 if __name__ == '__main__':
-    app.run(host="172.26.0.72", port=5000, debug = True)
+    app.run(host="172.26.0.212", port=5000, debug = True)
