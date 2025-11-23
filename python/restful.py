@@ -258,6 +258,10 @@ def plan_joint_path_impl():
         return jsonify({"error": "Robot is busy"}), 409
     try: return plan_joint_path()
     finally: moveit_lock.release()
+@app.route('/recover', methods = ['GET'])
+def recover():
+    robot.recover()
+    return jsonify({"status": "recovered","msg": "Robot recovered"}), 200
 
 @app.route('/control/stop', methods = ['GET'])
 def stop():
@@ -265,4 +269,4 @@ def stop():
     return jsonify({"status": "stopped","msg": "Robot stopped"}), 200
 # driver function
 if __name__ == '__main__':
-    app.run(host="172.26.0.212", port=5000, debug = True)
+    app.run(host="192.168.0.102", port=5000, debug = True)

@@ -54,6 +54,9 @@ import moveit_commander
 import moveit_msgs.msg
 import geometry_msgs.msg
 
+import actionlib
+from franka_msgs.msg import ErrorRecoveryAction, ErrorRecoveryGoal
+
 try:
     from math import pi, tau, dist, fabs, cos
 except:  # For Python 2 compatibility
@@ -175,7 +178,29 @@ class MoveGroupPythonInterfaceTutorial(object):
         self.planning_frame = planning_frame
         self.eef_link = eef_link
         self.group_names = group_names
+    def recover(self, wait=True, timeout=None):
+        """
+        Trigger Franka automatic error recovery once.
+        - wait: block until done
+        - timeout: rospy.Duration, e.g. rospy.Duration(5.0)
+        """
+        action_name="/franka_control/error_recovery"
+        client = actionlib.SimpleActionClient(action_name, ErrorRecoveryAction)
+        rospy.loginfo(f"Waiting for {action_name} action server...")
+        client.wait_for_server()
+        rospy.loginfo("Franka error recovery server ready.")
+        goal = ErrorRecoveryGoal()  # empty goal
+        client.send_goal(goal)
 
+        if wait:
+            if timeout is None:
+                client.wait_for_result()
+                return True
+            else:
+                ok = client.wait_for_result(timeout)
+                return bool(ok)
+        return True
+    
     def go_to_joint_state(self):
         # Copy class variables to local variables to make the web tutorials more clear.
         # In practice, you should use the class variables directly unless you have a good
@@ -371,7 +396,7 @@ class MoveGroupPythonInterfaceTutorial(object):
         # In practice, you should use the class variables directly unless you have a good
         # reason not to.
         move_group = self.move_group
-
+        move_group.set_planner_id("LIN")
         ## BEGIN_SUB_TUTORIAL plan_cartesian_path
         ##
         ## Cartesian Paths
@@ -400,10 +425,11 @@ class MoveGroupPythonInterfaceTutorial(object):
         (plan_success, plan, planning_time, error_code) = move_group.plan()
         print(plan_success, planning_time, error_code)
         #set speed
-        velocity_scaling_factor = 0.05
+        velocity_scaling_factor = 0.30
         plan = move_group.retime_trajectory(moveit_commander.RobotCommander().get_current_state(), 
                                        plan, 
-                                       velocity_scaling_factor)
+                                       velocity_scaling_factor,
+                                       acceleration_scaling_factor=0.050)
         # Note: We are just planning, not asking move_group to actually move the robot yet:
         return (plan_success, plan, planning_time, error_code)
 
