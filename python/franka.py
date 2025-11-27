@@ -134,6 +134,20 @@ class MoveGroupPythonInterfaceTutorial(object):
         hand_group_name = "panda_hand"
         move_group = moveit_commander.MoveGroupCommander(group_name)
 
+        # ---- 给关节3加一个软限制：比如 -2 ~ +2 rad ----
+        from moveit_msgs.msg import Constraints, JointConstraint
+        soft_limits = Constraints()
+
+        jc2 = JointConstraint()
+        jc2.joint_name = "panda_joint2"
+        jc2.position = 0.0           # 以 0 为中心
+        jc2.tolerance_above = 0.6    # 上面  +2 rad
+        jc2.tolerance_below = 0.6    # 下面  -2 rad
+        jc2.weight = 1.0             # 权重 1
+
+        soft_limits.joint_constraints.append(jc2)
+
+
         hand_group = moveit_commander.MoveGroupCommander(hand_group_name)
         ## Create a `DisplayTrajectory`_ ROS publisher which is used to display
         ## trajectories in Rviz:
@@ -247,8 +261,8 @@ class MoveGroupPythonInterfaceTutorial(object):
     def go_to_gripper_state(self, width):
 
         #max 0.039893
-        if width > 0.039893:
-            width = 0.039
+        if width > 0.038:
+            width = 0.038
         # Copy class variables to local variables to make the web tutorials more clear.
         # In practice, you should use the class variables directly unless you have a good
         # reason not to.
