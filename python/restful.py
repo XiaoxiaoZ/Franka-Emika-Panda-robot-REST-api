@@ -55,7 +55,7 @@ def get_state():
     pose = robot.move_group.get_current_pose()
     gripper_width = robot.hand_group.get_current_joint_values()[0]
     #print("gripper_width:",gripper_width)
-    if gripper_width>0.035:
+    if gripper_width>0.03:
         gripper = 1 # open
     else:
         gripper = 0 # close
@@ -269,4 +269,5 @@ def stop():
     return jsonify({"status": "stopped","msg": "Robot stopped"}), 200
 # driver function
 if __name__ == '__main__':
-    app.run(host="192.168.0.102", port=5000, debug = True)
+    #app.run(host="192.168.0.102", port=5000, debug = True)
+    app.run(host="172.26.0.212", port=5000, debug = True)

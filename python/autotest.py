@@ -4,14 +4,14 @@ import requests
 import json
 
 # ---------------- 配置默认 URL 和参数 ----------------
-DEFAULT_DETECT_URL   = "http://192.168.0.205:5000/detect"
-DEFAULT_MOVE_URL     = "http://192.168.0.102:5000/control/plan_joint_path"
-DEFAULT_RECOVER_URL  = "http://192.168.0.102:5000/recover"
-DEFAULT_GRIPPER_URL  = "http://192.168.0.102:5000/control/go_to_gripper_state"
+DEFAULT_DETECT_URL   = "http://172.26.0.205:5000/detect"
+DEFAULT_MOVE_URL     = "http://172.26.0.212:5000/control/plan_joint_path"
+DEFAULT_RECOVER_URL  = "http://172.26.0.212:5000/recover"
+DEFAULT_GRIPPER_URL  = "http://172.26.0.212:5000/control/go_to_gripper_state"
 
 # 预设位姿
-CAMERA_POSE  = (0.6, -0.2, 0.4)   # 拍照位
-KITTING_POSE = (0.588,  0.2378, 0.2)   # kitting 位
+CAMERA_POSE  = (0.6, -0.27, 0.4)   # 拍照位
+KITTING_POSE = (0.488,  0.2878, 0.2)   # kitting 位
 KITTING_ABOVE_POSE = (
     KITTING_POSE[0],
     KITTING_POSE[1],
@@ -62,13 +62,13 @@ class RobotGUI:
         # 预设位姿
         ttk.Button(
             btn_frame,
-            text="Go to CAMERA pose  (0.6, -0.2, 0.4)",
+            text="Go to CAMERA pose",
             command=self.go_to_camera_pose
         ).grid(row=0, column=0, columnspan=2, pady=3, sticky="ew")
 
         ttk.Button(
             btn_frame,
-            text="Go to KITTING pose (0.588, 0.2378, 0.2)",
+            text="Go to KITTING pose",
             command=self.go_to_kitting_pose
         ).grid(row=1, column=0, columnspan=2, pady=3, sticky="ew")
         ttk.Button(
@@ -274,7 +274,7 @@ class RobotGUI:
         self.control_gripper(0.08)
 
     def gripper_close(self):
-        self.control_gripper(0.01)
+        self.control_gripper(0.005)
 
     # ----------------- Recovery -----------------
     def recover(self):

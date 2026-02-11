@@ -261,8 +261,8 @@ class MoveGroupPythonInterfaceTutorial(object):
     def go_to_gripper_state(self, width):
 
         #max 0.039893
-        if width > 0.038:
-            width = 0.038
+        if width > 0.032:
+            width = 0.032
         # Copy class variables to local variables to make the web tutorials more clear.
         # In practice, you should use the class variables directly unless you have a good
         # reason not to.
@@ -595,8 +595,8 @@ class MoveGroupPythonInterfaceTutorial(object):
         box_name = "kiting box"
         box_pose1 = geometry_msgs.msg.PoseStamped()
         box_pose1.header.frame_id = move_group.get_planning_frame()
-        box_pose1.pose.position.x = 0.588  # 
-        box_pose1.pose.position.y = 0.2378  # 
+        box_pose1.pose.position.x = 0.488  # 
+        box_pose1.pose.position.y = 0.2878  # 
         box_pose1.pose.position.z = 0.07  # 
         scene.add_box(box_name, box_pose1, size=(0.30, 0.20, 0.17))
 
