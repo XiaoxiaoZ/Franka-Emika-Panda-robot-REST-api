@@ -1,9 +1,10 @@
-from flask import Flask, jsonify, request
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 import threading
 import time
 import requests
-
-app = Flask(__name__)
+import uvicorn
+from contextlib import asynccontextmanager
 
 # State variables
 state = {
@@ -60,24 +61,40 @@ def control_loop():
         
         time.sleep(0.1)  # Sleep to prevent high CPU usage
 
-# Start the control loop thread
-thread = threading.Thread(target=control_loop, daemon=True)
-thread.start()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start the control loop thread
+    thread = threading.Thread(target=control_loop, daemon=True)
+    thread.start()
+    yield
+    # Clean up if needed
 
-@app.route('/<variable>', methods=['GET', 'POST'])
-def handle_variable(variable):
+app = FastAPI(lifespan=lifespan)
+
+@app.api_route("/{variable}", methods=["GET", "POST"])
+async def handle_variable(variable: str, request: Request):
     if variable not in state:
-        return jsonify({"error": "Variable not found"}), 404
+        return JSONResponse(content={"error": "Variable not found"}, status_code=404)
 
-    if request.method == 'GET':
+    if request.method == "GET":
         with lock:
-            return jsonify({variable: state[variable]})
+            val = state[variable]
+            if variable in ["vX", "vY", "vZ", "vGripperWidth"]:
+                return float(val)
+            elif variable in ["vStartOperation", "vStartOperationDone"]:
+                return int(val)
+            return val
 
-    elif request.method == 'POST':
+    elif request.method == "POST":
         # Expecting raw string data like "value=1"
-        data = request.get_data(as_text=True)
+        body_bytes = await request.body()
+        try:
+            data = body_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return JSONResponse(content={"error": "Invalid encoding"}, status_code=400)
+
         if not data.startswith("value="):
-            return jsonify({"error": "Invalid format. Expected 'value=<val>'"}), 400
+            return JSONResponse(content={"error": "Invalid format. Expected 'value=<val>'"}, status_code=400)
         
         try:
             value_str = data.split("value=")[1]
@@ -86,16 +103,16 @@ def handle_variable(variable):
             elif variable in ["vStartOperation", "vStartOperationDone"]:
                 new_value = int(value_str)
             else:
-                 return jsonify({"error": "Unknown variable type"}), 500
+                 return JSONResponse(content={"error": "Unknown variable type"}, status_code=500)
                  
             with lock:
                 state[variable] = new_value
             
-            return jsonify({"success": True, variable: new_value})
+            return JSONResponse(content={"success": True, variable: new_value})
             
         except ValueError:
-             return jsonify({"error": "Invalid value type"}), 400
+             return JSONResponse(content={"error": "Invalid value type"}, status_code=400)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Run on a different port to avoid conflict with restful.py (default 5000)
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    uvicorn.run(app, host="172.26.0.212", port=5001)

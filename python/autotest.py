@@ -8,6 +8,7 @@ DEFAULT_DETECT_URL   = "http://172.26.0.205:5000/detect"
 DEFAULT_MOVE_URL     = "http://172.26.0.212:5000/control/plan_joint_path"
 DEFAULT_RECOVER_URL  = "http://172.26.0.212:5000/recover"
 DEFAULT_GRIPPER_URL  = "http://172.26.0.212:5000/control/go_to_gripper_state"
+DEFAULT_STATE_URL    = "http://172.26.0.212:5000/state"
 
 # 预设位姿
 CAMERA_POSE  = (0.6, -0.27, 0.4)   # 拍照位
@@ -35,6 +36,7 @@ class RobotGUI:
         self.move_url_var    = tk.StringVar(value=DEFAULT_MOVE_URL)
         self.recover_url_var = tk.StringVar(value=DEFAULT_RECOVER_URL)
         self.gripper_url_var = tk.StringVar(value=DEFAULT_GRIPPER_URL)
+        self.state_url_var   = tk.StringVar(value=DEFAULT_STATE_URL)
 
         self._build_widgets()
 
@@ -54,6 +56,9 @@ class RobotGUI:
 
         ttk.Label(url_frame, text="Gripper URL:").grid(row=3, column=0, sticky="e")
         ttk.Entry(url_frame, textvariable=self.gripper_url_var, width=55).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(url_frame, text="State URL:").grid(row=4, column=0, sticky="e")
+        ttk.Entry(url_frame, textvariable=self.state_url_var, width=55).grid(row=4, column=1, sticky="w")
 
         # ----- 控制按钮区域 -----
         btn_frame = ttk.LabelFrame(self.root, text="Controls")
@@ -117,9 +122,15 @@ class RobotGUI:
 
         ttk.Button(
             btn_frame,
+            text="Get State",
+            command=self.get_robot_state
+        ).grid(row=6, column=1, pady=3, sticky="ew")
+
+        ttk.Button(
+            btn_frame,
             text="Quit",
             command=self.root.quit
-        ).grid(row=6, column=1, pady=3, sticky="ew")
+        ).grid(row=6, column=2, pady=3, sticky="ew")
 
         # ----- 物件列表 -----
         list_frame = ttk.LabelFrame(self.root, text="Detected objects")
@@ -286,6 +297,30 @@ class RobotGUI:
             self.log(f"[ERROR] Recovery failed: {e}")
             messagebox.showerror("Recovery error", str(e))
 
+    # ----------------- State -----------------
+    def get_robot_state(self):
+        url = self.state_url_var.get().strip()
+        self.log("Getting Robot State...")
+        try:
+            resp = self.http_get(url, timeout=5)
+            data = resp.json()
+            # Format the output nicer
+            pos = data.get("position", {})
+            ori = data.get("orientation", {})
+            gripper = data.get("gripper", -1)
+            
+            msg = (
+                f"State:\n"
+                f"  Position: x={pos.get('x',0):.3f}, y={pos.get('y',0):.3f}, z={pos.get('z',0):.3f}\n"
+                f"  Orientation: x={ori.get('x',0):.3f}, y={ori.get('y',0):.3f}, z={ori.get('z',0):.3f}, w={ori.get('w',0):.3f}\n"
+                f"  Gripper: {'OPEN' if gripper==1 else 'CLOSED' if gripper==0 else 'UNKNOWN'}"
+            )
+            self.log(msg)
+            messagebox.showinfo("Robot State", msg)
+            
+        except Exception as e:
+            self.log(f"[ERROR] Get State failed: {e}")
+            messagebox.showerror("State error", str(e))
 
 if __name__ == "__main__":
     root = tk.Tk()

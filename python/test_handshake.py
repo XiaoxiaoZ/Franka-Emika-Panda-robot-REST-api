@@ -4,7 +4,7 @@ import threading
 from flask import Flask, request, jsonify
 
 # Configuration
-HANDSHAKE_SERVER_URL = "http://127.0.0.1:5001"
+HANDSHAKE_SERVER_URL = "http://172.26.0.212:5001"
 MOCK_RESTFUL_PORT = 5000
 
 # Mock restful server for testing
@@ -39,14 +39,14 @@ def test_handshake():
     
     # 1. Set variables
     print("Setting variables...")
-    requests.post(f"{HANDSHAKE_SERVER_URL}/vX", data="value=0.5")
-    requests.post(f"{HANDSHAKE_SERVER_URL}/vY", data="value=-0.2")
-    requests.post(f"{HANDSHAKE_SERVER_URL}/vZ", data="value=0.4")
-    requests.post(f"{HANDSHAKE_SERVER_URL}/vGripperWidth", data="value=0.02")
+    requests.post(f"{HANDSHAKE_SERVER_URL}/vX", data="value=0.003")
+    requests.post(f"{HANDSHAKE_SERVER_URL}/vY", data="value=0.603")
+    requests.post(f"{HANDSHAKE_SERVER_URL}/vZ", data="value=0.340")
+    requests.post(f"{HANDSHAKE_SERVER_URL}/vGripperWidth", data="value=0.1")
     
     # Verify variables set
     resp = requests.get(f"{HANDSHAKE_SERVER_URL}/vX").json()
-    assert resp['vX'] == 0.5
+    assert resp['vX'] == 0.003
     print("Variables set correctly.")
 
     # 2. Start Operation
