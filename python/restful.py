@@ -6,7 +6,7 @@ from flask import Flask, jsonify, request
 from threading import Lock
 
 # Log
-from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits
+from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits, is_user_stop_abort
 import rospy
 from rosgraph_msgs.msg import Log
 
@@ -406,7 +406,17 @@ def _format_motion_response(outcome, extra=None):
         body["hint"] = "release the Panda user-stop button on the hardware before retrying; software cannot clear this state"
         return jsonify({**body, "msg": "motion blocked: Panda user-stop button is active"}), 409
     if outcome['outcome'] == 'plan_failed':
-        body["last_error"] = last_error[-1] if last_error else None
+        last_err = last_error[-1] if last_error else None
+        body["last_error"] = last_err
+        # Re-classify plan-failed as user-stop if the rosout shows it.
+        # User-stop is persistent state, so we don't require the error to be
+        # freshly logged within this motion's baseline -- the button being
+        # pressed at all is enough.
+        if is_user_stop_abort(last_err):
+            body["outcome"] = "stopped_user_button"
+            body["stop_reason"] = last_err
+            body["hint"] = "release the Panda user-stop button on the hardware before retrying; software cannot clear this state"
+            return jsonify({**body, "msg": "motion blocked: Panda user-stop button is active"}), 409
         return jsonify({**body, "msg": "Plan not 100%"}), 202
     if outcome['outcome'] == 'plan_would_violate_limits':
         body["trajectory_violations"] = outcome.get('trajectory_violations', [])
