@@ -277,7 +277,11 @@ def _format_motion_response(outcome, extra=None):
     if outcome['outcome'] == 'success':
         return jsonify({**body, "msg": "Plan 100%"}), 200
     if outcome['outcome'] == 'stopped':
+        body["stop_reason"] = outcome.get('stop_reason', 'user /control/stop')
         return jsonify({**body, "msg": "motion stopped by user /control/stop"}), 200
+    if outcome['outcome'] == 'stopped_external_force':
+        body["stop_reason"] = outcome.get('stop_reason', 'external-force reflex')
+        return jsonify({**body, "msg": "motion stopped by external-force reflex (likely user hand); not retrying"}), 200
     if outcome['outcome'] == 'plan_failed':
         body["last_error"] = last_error[-1] if last_error else None
         return jsonify({**body, "msg": "Plan not 100%"}), 202
@@ -300,7 +304,12 @@ def plan_cartesian_path():
         plan, fraction = robot.plan_cartesian_path(x, y, z, preserve_orientation=preserve_orientation)
         return plan, fraction >= 1.0, {"fraction": fraction}
 
-    outcome = robot.plan_and_execute_with_retry(plan_fn, auto_recover=auto_recover, max_retries=max_retries)
+    outcome = robot.plan_and_execute_with_retry(
+        plan_fn,
+        auto_recover=auto_recover,
+        max_retries=max_retries,
+        get_last_error=lambda: last_error[-1] if last_error else None,
+    )
     extra = {"fraction": str(outcome['plan_metadata'].get('fraction'))}
     if outcome['outcome'] == 'plan_failed':
         extra["moveit_error"] = f"PARTIAL_PATH (fraction={outcome['plan_metadata'].get('fraction')}, likely unreachable target or constraint too tight)"
@@ -325,7 +334,12 @@ def plan_joint_path():
         (plan_success, plan, planning_time, error_code) = robot.plan_joint_path(x, y, z, preserve_orientation=preserve_orientation)
         return plan, bool(plan_success), {"planning_time": planning_time, "error_code": error_code}
 
-    outcome = robot.plan_and_execute_with_retry(plan_fn, auto_recover=auto_recover, max_retries=max_retries)
+    outcome = robot.plan_and_execute_with_retry(
+        plan_fn,
+        auto_recover=auto_recover,
+        max_retries=max_retries,
+        get_last_error=lambda: last_error[-1] if last_error else None,
+    )
     extra = {"planning_time": str(outcome['plan_metadata'].get('planning_time'))}
     if outcome['outcome'] == 'plan_failed':
         extra["moveit_error"] = decode_moveit_error(outcome['plan_metadata'].get('error_code'))

@@ -108,6 +108,21 @@ def decode_moveit_error(error_code):
     return MOVEIT_ERROR_DECODE.get(val, f"UNKNOWN_ERROR_{val}")
 
 
+def is_external_force_abort(error_text):
+    """Best-effort: did this reflex fire because of external force (user hand,
+    unexpected contact) rather than a controller-internal violation?
+
+    Franka labels external-force reflexes as `cartesian_reflex` or
+    `joint_reflex`. Limit/profile violations like
+    `joint_motion_generator_position_limits_violation` are controller-internal
+    and are usually worth auto-retrying after /recover.
+    """
+    if not error_text:
+        return False
+    lower = error_text.lower()
+    return "cartesian_reflex" in lower or "joint_reflex" in lower
+
+
 def all_close(goal, actual, tolerance):
     """
     Convenience method for testing if the values in two lists are within a tolerance of each other.
@@ -398,13 +413,18 @@ class MoveGroupPythonInterfaceTutorial(object):
         current_pose = self.move_group.get_current_pose().pose
         return all_close(pose_goal, current_pose, 0.01)
 
-    def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1):
+    def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1, get_last_error=None):
         """Plan, execute, and auto-recover on execute failure.
 
         plan_fn: callable returning (plan, plan_ok, metadata)
           plan: RobotTrajectory
           plan_ok: bool (False if plan incomplete / planner failed)
           metadata: dict (fraction, error_code, planning_time)
+
+        get_last_error: optional callable returning the last rosout ERROR
+          string. Used to classify execute failures: external-force reflexes
+          (user hand / unexpected contact) are NOT auto-recovered, because
+          the user probably wants the motion to stop, not resume.
 
         Recovery strategy: execute failures are treated as reflex-style errors.
         On failure: call recover(), replan via plan_fn (robot state drifted),
@@ -414,11 +434,13 @@ class MoveGroupPythonInterfaceTutorial(object):
         target that's unreachable / in collision / etc.
 
         Returns dict:
-          outcome: 'success' | 'plan_failed' | 'execute_failed' | 'recovery_failed'
+          outcome: 'success' | 'plan_failed' | 'execute_failed' |
+                   'recovery_failed' | 'stopped' | 'stopped_external_force'
           recovery_triggered: bool
           recovery_succeeded: bool
           attempts: int
           plan_metadata: whatever plan_fn returned on the final attempt
+          stop_reason: only present on 'stopped'/'stopped_external_force'
         """
         recovery_triggered = False
         recovery_succeeded = False
@@ -453,6 +475,7 @@ class MoveGroupPythonInterfaceTutorial(object):
                     'recovery_succeeded': recovery_succeeded,
                     'attempts': attempts,
                     'plan_metadata': last_meta,
+                    'stop_reason': 'user /control/stop',
                 }
             if ok:
                 return {
@@ -461,6 +484,20 @@ class MoveGroupPythonInterfaceTutorial(object):
                     'recovery_succeeded': recovery_succeeded,
                     'attempts': attempts,
                     'plan_metadata': last_meta,
+                }
+
+            # Execute failed. Before auto-recovering, check whether this was
+            # an external-force reflex (user hand pushing the robot). If so,
+            # respect the user's intent and do not retry.
+            last_err = get_last_error() if get_last_error else None
+            if is_external_force_abort(last_err):
+                return {
+                    'outcome': 'stopped_external_force',
+                    'recovery_triggered': recovery_triggered,
+                    'recovery_succeeded': recovery_succeeded,
+                    'attempts': attempts,
+                    'plan_metadata': last_meta,
+                    'stop_reason': last_err,
                 }
 
             if not auto_recover or attempts > max_retries:

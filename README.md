@@ -129,3 +129,7 @@ Some parts of this codebase are known-limited or known-broken. Expect follow-up 
 - Motion endpoints serialize via a non-blocking lock — concurrent motion requests get 409 "Robot is busy" rather than queuing.
 - Motions apply an orientation path constraint (±0.5 rad) to prevent mid-path IK flips. Constraint is suppressed when `preserve_orientation=0` (so the wrist is allowed to freely reorient to the new target).
 - Motion endpoints auto-recover from reflex errors by default: on execute failure, `/franka_control/error_recovery` is called and the motion is retried once (configurable via `max_retries`). Recovery status is surfaced in the response (`recovery_triggered`, `recovery_succeeded`, `attempts`).
+- Auto-recovery is suppressed for **user-initiated stops** (two kinds):
+  - `GET /control/stop` → motion request returns `outcome: stopped`.
+  - **Pushing the robot by hand** → triggers a `cartesian_reflex` or `joint_reflex`, which the wrapper classifies as external-force and reports as `outcome: stopped_external_force`. Robot does not resume when you let go.
+  - Other reflex types (e.g. `joint_motion_generator_position_limits_violation`) are still auto-recovered because they represent controller-internal violations worth retrying.
