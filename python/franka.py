@@ -174,6 +174,17 @@ def check_trajectory_for_limits(plan, margin_rad=0.02):
     return violations
 
 
+def is_user_stop_abort(error_text):
+    """Detect Panda hardware user-stop button activation. libfranka emits
+    `Move command aborted: User Stop pressed!` when the physical safety
+    button is depressed. No software action clears it -- the user must
+    release the button on the hardware."""
+    if not error_text:
+        return False
+    lower = error_text.lower()
+    return "user stop" in lower or "user_stop" in lower
+
+
 def is_external_force_abort(error_text):
     """Best-effort: did this reflex fire because of external force (user hand,
     unexpected contact) rather than a controller-internal violation?
@@ -634,6 +645,19 @@ class MoveGroupPythonInterfaceTutorial(object):
             self.display_trajectory(plan)
 
             if not plan_ok:
+                # Distinguish plan-failed-because-user-stop-is-pressed from
+                # plan-failed-because-target-is-unreachable: the former is
+                # actionable only by physically releasing the button.
+                last_err = get_last_error() if get_last_error else None
+                if is_user_stop_abort(last_err):
+                    return {
+                        'outcome': 'stopped_user_button',
+                        'recovery_triggered': recovery_triggered,
+                        'recovery_succeeded': recovery_succeeded,
+                        'attempts': attempts,
+                        'plan_metadata': last_meta,
+                        'stop_reason': last_err,
+                    }
                 return {
                     'outcome': 'plan_failed',
                     'recovery_triggered': recovery_triggered,
@@ -680,9 +704,19 @@ class MoveGroupPythonInterfaceTutorial(object):
                 }
 
             # Execute failed. Before auto-recovering, check whether this was
-            # an external-force reflex (user hand pushing the robot). If so,
-            # respect the user's intent and do not retry.
+            # an external-force reflex (user hand pushing the robot) or the
+            # hardware user-stop button. In both cases, respect the user's
+            # intent and do not retry.
             last_err = get_last_error() if get_last_error else None
+            if is_user_stop_abort(last_err):
+                return {
+                    'outcome': 'stopped_user_button',
+                    'recovery_triggered': recovery_triggered,
+                    'recovery_succeeded': recovery_succeeded,
+                    'attempts': attempts,
+                    'plan_metadata': last_meta,
+                    'stop_reason': last_err,
+                }
             if is_external_force_abort(last_err):
                 return {
                     'outcome': 'stopped_external_force',

@@ -401,6 +401,10 @@ def _format_motion_response(outcome, extra=None):
     if outcome['outcome'] == 'stopped_external_force':
         body["stop_reason"] = outcome.get('stop_reason', 'external-force reflex')
         return jsonify({**body, "msg": "motion stopped by external-force reflex (likely user hand); not retrying"}), 200
+    if outcome['outcome'] == 'stopped_user_button':
+        body["stop_reason"] = outcome.get('stop_reason', 'hardware user-stop button pressed')
+        body["hint"] = "release the Panda user-stop button on the hardware before retrying; software cannot clear this state"
+        return jsonify({**body, "msg": "motion blocked: Panda user-stop button is active"}), 409
     if outcome['outcome'] == 'plan_failed':
         body["last_error"] = last_error[-1] if last_error else None
         return jsonify({**body, "msg": "Plan not 100%"}), 202
