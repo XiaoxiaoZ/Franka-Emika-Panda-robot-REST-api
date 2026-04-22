@@ -6,7 +6,7 @@ from flask import Flask, jsonify, request
 from threading import Lock
 
 # Log
-from franka import MoveGroupPythonInterfaceTutorial
+from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error
 import rospy
 from rosgraph_msgs.msg import Log
 
@@ -145,28 +145,35 @@ def gripper_open1():
     Optional query params:
       width: target opening in meters (default 0.08)
       speed: opening speed in m/s (default 0.1)
+      timeout: seconds to wait for result (default 10.0)
     """
     try:
         width = float(request.args.get("width", "0.08"))  # Panda max ≈ 0.08 m
         speed = float(request.args.get("speed", "0.1"))
+        timeout_s = float(request.args.get("timeout", "10.0"))
     except (TypeError, ValueError):
-        return jsonify({"error": "Bad width/speed params"}), 400
+        return jsonify({"error": "Bad width/speed/timeout params"}), 400
+
+    if not gripper_move_client.wait_for_server(rospy.Duration(1.0)):
+        return jsonify({"error": "franka_gripper/move action server not reachable"}), 503
 
     goal = MoveGoal()
     goal.width = width
     goal.speed = speed
 
-    try:
-        gripper_move_client.send_goal(goal)
-        gripper_move_client.wait_for_result()
-        result = gripper_move_client.get_result()
-    except Exception as e:
-        return jsonify({"error": f"franka_gripper move failed: {e}"}), 500
+    gripper_move_client.send_goal(goal)
+    finished = gripper_move_client.wait_for_result(rospy.Duration(timeout_s))
+    if not finished:
+        gripper_move_client.cancel_goal()
+        return jsonify({"error": f"franka_gripper move timed out after {timeout_s}s"}), 504
+    result = gripper_move_client.get_result()
 
+    ok = result is not None and bool(getattr(result, "success", False))
     return jsonify({
-        "success": bool(getattr(result, "success", True)),
-        "final_width_cmd": float(width)
-    }), 200
+        "success": ok,
+        "error_msg": None if ok else getattr(result, "error", "no result"),
+        "final_width_cmd": float(width),
+    }), 200 if ok else 500
 
 
 def gripper_close1():
@@ -179,6 +186,7 @@ def gripper_close1():
       force: grip force (N, default 20.0)
       eps_in: epsilon.inner, allowed inner tolerance (default 0.005)
       eps_out: epsilon.outer, allowed outer tolerance (default 0.005)
+      timeout: seconds to wait for result (default 10.0)
     """
     try:
         width = float(request.args.get("width", "0.0"))
@@ -186,8 +194,12 @@ def gripper_close1():
         force = float(request.args.get("force", "20.0"))
         eps_in = float(request.args.get("eps_in", "0.005"))
         eps_out = float(request.args.get("eps_out", "0.005"))
+        timeout_s = float(request.args.get("timeout", "10.0"))
     except (TypeError, ValueError):
         return jsonify({"error": "Bad grasp params"}), 400
+
+    if not gripper_grasp_client.wait_for_server(rospy.Duration(1.0)):
+        return jsonify({"error": "franka_gripper/grasp action server not reachable"}), 503
 
     goal = GraspGoal()
     goal.width = width
@@ -196,19 +208,21 @@ def gripper_close1():
     goal.epsilon.inner = eps_in
     goal.epsilon.outer = eps_out
 
-    try:
-        gripper_grasp_client.send_goal(goal)
-        gripper_grasp_client.wait_for_result()
-        result = gripper_grasp_client.get_result()
-    except Exception as e:
-        return jsonify({"error": f"franka_gripper grasp failed: {e}"}), 500
+    gripper_grasp_client.send_goal(goal)
+    finished = gripper_grasp_client.wait_for_result(rospy.Duration(timeout_s))
+    if not finished:
+        gripper_grasp_client.cancel_goal()
+        return jsonify({"error": f"franka_gripper grasp timed out after {timeout_s}s"}), 504
+    result = gripper_grasp_client.get_result()
 
+    ok = result is not None and bool(getattr(result, "success", False))
     return jsonify({
-        "success": bool(getattr(result, "success", True)),
+        "success": ok,
+        "error_msg": None if ok else getattr(result, "error", "no result"),
         "used_width_cmd": float(width),
         "force": float(force)
-    }), 200
-     
+    }), 200 if ok else 500
+
 @app.route('/control/gripper_open', methods = ['GET'])
 def gripper_open_impl():
     if not moveit_lock.acquire(blocking=False):
@@ -223,48 +237,99 @@ def gripper_close_impl():
     try: return gripper_close()
     finally: moveit_lock.release()
 
+@app.route('/control/gripper_open_force', methods = ['GET'])
+def gripper_open_force_impl():
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try: return gripper_open1()
+    finally: moveit_lock.release()
+
+@app.route('/control/gripper_grasp', methods = ['GET'])
+def gripper_grasp_impl():
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try: return gripper_close1()
+    finally: moveit_lock.release()
+
+def _parse_motion_args():
+    """Common parse for motion endpoints.
+    Returns (x, y, z, auto_recover, max_retries, preserve_orientation) or raises."""
+    x = float(request.args.get("x"))
+    y = float(request.args.get("y"))
+    z = float(request.args.get("z"))
+    auto_recover = request.args.get("auto_recover", "1") != "0"
+    max_retries = int(request.args.get("max_retries", "1"))
+    preserve_orientation = request.args.get("preserve_orientation", "1") != "0"
+    return x, y, z, auto_recover, max_retries, preserve_orientation
+
+
+def _format_motion_response(outcome, extra=None):
+    """Translate plan_and_execute_with_retry outcome dict into (json_body, status)."""
+    body = {
+        "outcome": outcome['outcome'],
+        "attempts": outcome['attempts'],
+        "recovery_triggered": outcome['recovery_triggered'],
+        "recovery_succeeded": outcome['recovery_succeeded'] if outcome['recovery_triggered'] else None,
+    }
+    if extra:
+        body.update(extra)
+
+    if outcome['outcome'] == 'success':
+        return jsonify({**body, "msg": "Plan 100%"}), 200
+    if outcome['outcome'] == 'plan_failed':
+        body["last_error"] = last_error[-1] if last_error else None
+        return jsonify({**body, "msg": "Plan not 100%"}), 202
+    if outcome['outcome'] == 'execute_failed':
+        body["last_error"] = last_error[-1] if last_error else None
+        return jsonify({**body, "msg": "execution failed"}), 500
+    if outcome['outcome'] == 'recovery_failed':
+        body["last_error"] = last_error[-1] if last_error else None
+        return jsonify({**body, "msg": "execute failed and recovery also failed"}), 500
+    return jsonify({**body, "msg": "unknown outcome"}), 500
+
+
 def plan_cartesian_path():
     try:
-        x = float(request.args.get("x"))
-        y = float(request.args.get("y"))
-        z = float(request.args.get("z"))
+        x, y, z, auto_recover, max_retries, preserve_orientation = _parse_motion_args()
     except (TypeError, ValueError):
         return jsonify({"error": "Error xy args"}), 400
-    plan, result = robot.plan_cartesian_path(x, y, z)
-    robot.display_trajectory(plan)
-    if result<1.0:
-        print("plan:",plan)
-        return jsonify({"msg": "Plan not 100%","result": str(result)}), 202
-    #print("result:",result)
-    else:
-        success = robot.execute_plan(plan)
-        print(success)
-        if not success:
-            return jsonify({"error": last_error or "Exception failed"}), 500
-        return jsonify({"msg": "Plan 100%", "result": str(result)}), 200
+
+    def plan_fn():
+        plan, fraction = robot.plan_cartesian_path(x, y, z, preserve_orientation=preserve_orientation)
+        return plan, fraction >= 1.0, {"fraction": fraction}
+
+    outcome = robot.plan_and_execute_with_retry(plan_fn, auto_recover=auto_recover, max_retries=max_retries)
+    extra = {"fraction": str(outcome['plan_metadata'].get('fraction'))}
+    if outcome['outcome'] == 'plan_failed':
+        extra["moveit_error"] = f"PARTIAL_PATH (fraction={outcome['plan_metadata'].get('fraction')}, likely unreachable target or constraint too tight)"
+    return _format_motion_response(outcome, extra)
+
+
 @app.route('/control/plan_cartesian_path', methods = ['GET'])
 def plan_cartesian_path_impl():
     if not moveit_lock.acquire(blocking=False):
         return jsonify({"error": "Robot is busy"}), 409
     try: return plan_cartesian_path()
     finally: moveit_lock.release()
-    
+
+
 def plan_joint_path():
     try:
-        x = float(request.args.get("x"))
-        y = float(request.args.get("y"))
-        z = float(request.args.get("z"))
+        x, y, z, auto_recover, max_retries, preserve_orientation = _parse_motion_args()
     except (TypeError, ValueError):
         return jsonify({"error": "Error xy args"}), 400
-    (plan_success, plan, planning_time, error_code) = robot.plan_joint_path(x, y, z)
-    robot.display_trajectory(plan)
-    if not plan_success:
-        return jsonify({"error_code": str(error_code), "palnning_time": str(planning_time)}), 202
-    success = robot.execute_plan(plan)
-    print(success)
-    if not success:
-        return jsonify({"error": last_error or "Exception failed"}), 500
-    return jsonify({"msg": "Plan 100%", "planning_time": str(planning_time)}), 200
+
+    def plan_fn():
+        (plan_success, plan, planning_time, error_code) = robot.plan_joint_path(x, y, z, preserve_orientation=preserve_orientation)
+        return plan, bool(plan_success), {"planning_time": planning_time, "error_code": error_code}
+
+    outcome = robot.plan_and_execute_with_retry(plan_fn, auto_recover=auto_recover, max_retries=max_retries)
+    extra = {"planning_time": str(outcome['plan_metadata'].get('planning_time'))}
+    if outcome['outcome'] == 'plan_failed':
+        extra["moveit_error"] = decode_moveit_error(outcome['plan_metadata'].get('error_code'))
+    return _format_motion_response(outcome, extra)
+
+
 @app.route('/control/plan_joint_path', methods = ['GET'])
 def plan_joint_path_impl():
     if not moveit_lock.acquire(blocking=False):

@@ -71,6 +71,41 @@ except:  # For Python 2 compatibility
 from std_msgs.msg import String
 from moveit_commander.conversions import pose_to_list
 from geometry_msgs.msg import Pose
+from moveit_msgs.msg import MoveItErrorCodes
+
+
+MOVEIT_ERROR_DECODE = {
+    MoveItErrorCodes.SUCCESS: "SUCCESS",
+    MoveItErrorCodes.FAILURE: "FAILURE",
+    MoveItErrorCodes.PLANNING_FAILED: "PLANNING_FAILED: planner found no valid plan",
+    MoveItErrorCodes.INVALID_MOTION_PLAN: "INVALID_MOTION_PLAN: plan has issues (self-collision, joint limits)",
+    MoveItErrorCodes.MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE: "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE: scene changed during planning",
+    MoveItErrorCodes.CONTROL_FAILED: "CONTROL_FAILED: trajectory execution failed (reflex? controller? FCI?)",
+    MoveItErrorCodes.UNABLE_TO_AQUIRE_SENSOR_DATA: "UNABLE_TO_ACQUIRE_SENSOR_DATA",
+    MoveItErrorCodes.TIMED_OUT: "TIMED_OUT",
+    MoveItErrorCodes.PREEMPTED: "PREEMPTED: another goal replaced this one",
+    MoveItErrorCodes.START_STATE_IN_COLLISION: "START_STATE_IN_COLLISION: robot already in collision",
+    MoveItErrorCodes.START_STATE_VIOLATES_PATH_CONSTRAINTS: "START_STATE_VIOLATES_PATH_CONSTRAINTS: current orientation outside constraint tolerance",
+    MoveItErrorCodes.GOAL_IN_COLLISION: "GOAL_IN_COLLISION: target pose collides with scene",
+    MoveItErrorCodes.GOAL_VIOLATES_PATH_CONSTRAINTS: "GOAL_VIOLATES_PATH_CONSTRAINTS",
+    MoveItErrorCodes.GOAL_CONSTRAINTS_VIOLATED: "GOAL_CONSTRAINTS_VIOLATED",
+    MoveItErrorCodes.INVALID_GROUP_NAME: "INVALID_GROUP_NAME",
+    MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS: "INVALID_GOAL_CONSTRAINTS",
+    MoveItErrorCodes.INVALID_ROBOT_STATE: "INVALID_ROBOT_STATE",
+    MoveItErrorCodes.INVALID_LINK_NAME: "INVALID_LINK_NAME",
+    MoveItErrorCodes.INVALID_OBJECT_NAME: "INVALID_OBJECT_NAME",
+    MoveItErrorCodes.FRAME_TRANSFORM_FAILURE: "FRAME_TRANSFORM_FAILURE",
+    MoveItErrorCodes.COLLISION_CHECKING_UNAVAILABLE: "COLLISION_CHECKING_UNAVAILABLE",
+    MoveItErrorCodes.ROBOT_STATE_STALE: "ROBOT_STATE_STALE",
+    MoveItErrorCodes.SENSOR_INFO_STALE: "SENSOR_INFO_STALE",
+    MoveItErrorCodes.NO_IK_SOLUTION: "NO_IK_SOLUTION: target is reachable in position but orientation can't be achieved",
+}
+
+
+def decode_moveit_error(error_code):
+    """error_code may be a MoveItErrorCodes msg or an int."""
+    val = getattr(error_code, "val", error_code)
+    return MOVEIT_ERROR_DECODE.get(val, f"UNKNOWN_ERROR_{val}")
 
 
 def all_close(goal, actual, tolerance):
@@ -360,17 +395,98 @@ class MoveGroupPythonInterfaceTutorial(object):
         current_pose = self.move_group.get_current_pose().pose
         return all_close(pose_goal, current_pose, 0.01)
 
-    def _eef_orientation_constraint(self, tolerance=0.5):
-        # Keep the end-effector aligned with the target orientation (1,0,0,0)
+    def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1):
+        """Plan, execute, and auto-recover on execute failure.
+
+        plan_fn: callable returning (plan, plan_ok, metadata)
+          plan: RobotTrajectory
+          plan_ok: bool (False if plan incomplete / planner failed)
+          metadata: dict (fraction, error_code, planning_time)
+
+        Recovery strategy: execute failures are treated as reflex-style errors.
+        On failure: call recover(), replan via plan_fn (robot state drifted),
+        retry execute. Up to max_retries retries.
+
+        Plan failures (plan_ok=False) are not retried — recover can't help a
+        target that's unreachable / in collision / etc.
+
+        Returns dict:
+          outcome: 'success' | 'plan_failed' | 'execute_failed' | 'recovery_failed'
+          recovery_triggered: bool
+          recovery_succeeded: bool
+          attempts: int
+          plan_metadata: whatever plan_fn returned on the final attempt
+        """
+        recovery_triggered = False
+        recovery_succeeded = False
+        attempts = 0
+        last_meta = {}
+
+        while attempts <= max_retries:
+            attempts += 1
+            plan, plan_ok, meta = plan_fn()
+            last_meta = meta
+            self.display_trajectory(plan)
+
+            if not plan_ok:
+                return {
+                    'outcome': 'plan_failed',
+                    'recovery_triggered': recovery_triggered,
+                    'recovery_succeeded': recovery_succeeded,
+                    'attempts': attempts,
+                    'plan_metadata': last_meta,
+                }
+
+            ok = self.execute_plan(plan)
+            if ok:
+                return {
+                    'outcome': 'success',
+                    'recovery_triggered': recovery_triggered,
+                    'recovery_succeeded': recovery_succeeded,
+                    'attempts': attempts,
+                    'plan_metadata': last_meta,
+                }
+
+            if not auto_recover or attempts > max_retries:
+                return {
+                    'outcome': 'execute_failed',
+                    'recovery_triggered': recovery_triggered,
+                    'recovery_succeeded': recovery_succeeded,
+                    'attempts': attempts,
+                    'plan_metadata': last_meta,
+                }
+
+            # Execute failed, try recovery before retrying
+            recovery_triggered = True
+            recovery_succeeded = self.recover()
+            if not recovery_succeeded:
+                return {
+                    'outcome': 'recovery_failed',
+                    'recovery_triggered': True,
+                    'recovery_succeeded': False,
+                    'attempts': attempts,
+                    'plan_metadata': last_meta,
+                }
+
+        return {
+            'outcome': 'execute_failed',
+            'recovery_triggered': recovery_triggered,
+            'recovery_succeeded': recovery_succeeded,
+            'attempts': attempts,
+            'plan_metadata': last_meta,
+        }
+
+    def _eef_orientation_constraint(self, qx=1.0, qy=0.0, qz=0.0, qw=0.0, tolerance=0.5):
+        # Keep the end-effector aligned with the given target orientation
         # throughout the path. Blocks the planner from picking IK solutions that
         # flip the wrist/elbow mid-motion. tolerance is in radians on each axis.
         oc = moveit_msgs.msg.OrientationConstraint()
         oc.link_name = self.move_group.get_end_effector_link()
         oc.header.frame_id = self.move_group.get_planning_frame()
-        oc.orientation.x = 1.0
-        oc.orientation.y = 0.0
-        oc.orientation.z = 0.0
-        oc.orientation.w = 0.0
+        oc.orientation.x = qx
+        oc.orientation.y = qy
+        oc.orientation.z = qz
+        oc.orientation.w = qw
         oc.absolute_x_axis_tolerance = tolerance
         oc.absolute_y_axis_tolerance = tolerance
         oc.absolute_z_axis_tolerance = tolerance
@@ -379,37 +495,32 @@ class MoveGroupPythonInterfaceTutorial(object):
         constraints.orientation_constraints.append(oc)
         return constraints
 
-    def plan_cartesian_path(self, x, y, z=0.2, scale=1):
-        # Copy class variables to local variables to make the web tutorials more clear.
-        # In practice, you should use the class variables directly unless you have a good
-        # reason not to.
+    def plan_cartesian_path(self, x, y, z=0.2, scale=1, preserve_orientation=True):
+        # If preserve_orientation is True (default), the current wrist orientation
+        # is carried through the move. If False, the orientation is reset to
+        # (1,0,0,0) -- the legacy hardcoded target.
         move_group = self.move_group
 
-        ## BEGIN_SUB_TUTORIAL plan_cartesian_path
-        ##
-        ## Cartesian Paths
-        ## ^^^^^^^^^^^^^^^
-        ## You can plan a Cartesian path directly by specifying a list of waypoints
-        ## for the end-effector to go through. If executing  interactively in a
-        ## Python shell, set scale = 1.0.
-        ##
         waypoints = []
-
         wpose = move_group.get_current_pose().pose
-        wpose.position.x = scale * x  #
-        wpose.position.y = scale * y  #
-        wpose.position.z = scale * z  #
-        wpose.orientation.x = 1.0
-        wpose.orientation.y = 0.0
-        wpose.orientation.z = 0.0
-        wpose.orientation.w = 0.0
+        wpose.position.x = scale * x
+        wpose.position.y = scale * y
+        wpose.position.z = scale * z
+        if not preserve_orientation:
+            wpose.orientation.x = 1.0
+            wpose.orientation.y = 0.0
+            wpose.orientation.z = 0.0
+            wpose.orientation.w = 0.0
         waypoints.append(copy.deepcopy(wpose))
 
-        #print(wpose)
-        # eef_step=0.01: interpolate Cartesian path at 1 cm resolution.
-        # Note: jump_threshold is not exposed by this MoveIt build. Use an
-        # orientation path constraint instead to keep IK continuous.
-        move_group.set_path_constraints(self._eef_orientation_constraint())
+        # Apply orientation path constraint only when preserving orientation.
+        # If the caller is intentionally changing orientation, constraining
+        # the path to the new orientation makes the start state infeasible.
+        if preserve_orientation:
+            move_group.set_path_constraints(self._eef_orientation_constraint(
+                wpose.orientation.x, wpose.orientation.y,
+                wpose.orientation.z, wpose.orientation.w,
+            ))
         try:
             (plan, fraction) = move_group.compute_cartesian_path(
                 waypoints, 0.01
@@ -427,34 +538,32 @@ class MoveGroupPythonInterfaceTutorial(object):
 
         ## END_SUB_TUTORIAL
 
-    def plan_joint_path(self, x, y, z=0.2, scale=1):
-        # Copy class variables to local variables to make the web tutorials more clear.
-        # In practice, you should use the class variables directly unless you have a good
-        # reason not to.
+    def plan_joint_path(self, x, y, z=0.2, scale=1, preserve_orientation=True):
+        # If preserve_orientation is True (default), the current wrist orientation
+        # is carried through the move. If False, the orientation is reset to
+        # (1,0,0,0) -- the legacy hardcoded target.
         move_group = self.move_group
         move_group.set_planner_id("LIN")
-        ## BEGIN_SUB_TUTORIAL plan_cartesian_path
-        ##
-        ## Cartesian Paths
-        ## ^^^^^^^^^^^^^^^
-        ## You can plan a Cartesian path directly by specifying a list of waypoints
-        ## for the end-effector to go through. If executing  interactively in a
-        ## Python shell, set scale = 1.0.
-        ##
-
 
         wpose = move_group.get_current_pose().pose
-        wpose.position.x = scale * x  #
-        wpose.position.y = scale * y  #
-        wpose.position.z = scale * z  #
-        wpose.orientation.x = 1.0
-        wpose.orientation.y = 0.0
-        wpose.orientation.z = 0.0
-        wpose.orientation.w = 0.0
+        wpose.position.x = scale * x
+        wpose.position.y = scale * y
+        wpose.position.z = scale * z
+        if not preserve_orientation:
+            wpose.orientation.x = 1.0
+            wpose.orientation.y = 0.0
+            wpose.orientation.z = 0.0
+            wpose.orientation.w = 0.0
         move_group.set_pose_target(wpose)
         move_group.set_num_planning_attempts(10)
         move_group.set_planning_time(5.0)
-        move_group.set_path_constraints(self._eef_orientation_constraint())
+        # Apply orientation constraint only when preserving orientation -- see
+        # note in plan_cartesian_path for the rationale.
+        if preserve_orientation:
+            move_group.set_path_constraints(self._eef_orientation_constraint(
+                wpose.orientation.x, wpose.orientation.y,
+                wpose.orientation.z, wpose.orientation.w,
+            ))
         try:
             (plan_success, plan, planning_time, error_code) = move_group.plan()
         finally:

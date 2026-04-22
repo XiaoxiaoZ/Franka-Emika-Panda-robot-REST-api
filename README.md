@@ -36,16 +36,27 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 ### Control
 
 - `GET /control/plan_cartesian_path?x=<float>&y=<float>&z=<float>`
-  Plan and execute a straight-line Cartesian path to the target. Returns 202 with a fraction if the plan is incomplete, 200 on full execution.
+  Plan and execute a straight-line Cartesian path to the target.
+  Optional query params shared with `plan_joint_path`:
+  - `auto_recover=0/1` (default 1) — on execute failure, call `/franka_control/error_recovery` and retry
+  - `max_retries=N` (default 1) — retries after recovery
+  - `preserve_orientation=0/1` (default 1) — keep current wrist orientation vs. reset to canonical `(1,0,0,0)`. Set to 0 when you want the wrist to re-orient.
+  Response includes `outcome`, `attempts`, `recovery_triggered`, `recovery_succeeded`, `fraction`, and (on failure) `last_error` and `moveit_error`.
 
 - `GET /control/plan_joint_path?x=<float>&y=<float>&z=<float>`
-  Plan and execute a joint-space path (Pilz LIN with OMPL fallback).
+  Plan and execute a joint-space path (Pilz LIN with OMPL fallback). Accepts the same auto-recovery and orientation query params as `plan_cartesian_path`.
 
 - `GET /control/go_to_gripper_state?width=<float>`
   Move the gripper to the specified width (meters).
 
 - `GET /control/gripper_open` / `GET /control/gripper_close`
-  Shortcut for opening (0.1 m) / closing (0.01 m) the gripper.
+  MoveIt-based gripper control — shortcut for opening (0.1 m) / closing (0.01 m). No force feedback.
+
+- `GET /control/gripper_open_force?width=<m>&speed=<m/s>&timeout=<s>`
+  Force-based open via `/franka_gripper/move`. Timeout defaults to 10 s; returns 504 on timeout.
+
+- `GET /control/gripper_grasp?width=<m>&speed=<m/s>&force=<N>&eps_in=<m>&eps_out=<m>&timeout=<s>`
+  Force-based grasp via `/franka_gripper/grasp`. Use `width=0.0` to close until contact; widen `eps_out` (e.g. 0.08) for unknown object widths to get correct success reporting.
 
 - `GET /control/stop`
   Stop any ongoing motion and clear the current plan.
@@ -109,11 +120,12 @@ FRANKA_RESTFUL_HOST=0.0.0.0 python3 python/restful.py
 Some parts of this codebase are known-limited or known-broken. Expect follow-up work:
 
 - **`python/handshake_server.py` — legacy.** A FastAPI state-variable bridge on port 5001. Poll-loops over HTTP back into `restful.py`. Its original use case may no longer apply; kept in place pending a decision to delete or rewrite.
-- **Force-based gripper (`gripper_open1` / `gripper_close1` in `restful.py`) — broken.** Action-client-based gripper functions are currently unwired and have known runtime bugs. Don't wire them up without debugging first.
+- **Gripper auto-recovery — not implemented.** The motion endpoints auto-recover from reflex errors. The gripper endpoints don't, because correct gripper recovery depends on context (mid-pick vs mid-transit vs mid-release) and needs a dedicated design pass.
 - **Simulation / scene API — basic.** `/simulation/add_box` hardcodes a single fixed-size cube; `self.box_name` is a single slot that `add_floor()` overwrites, which can cause `/simulation/remove_box` to remove the wrong object. No shape/size/pose parameters. Scene mutations don't take the motion lock. Needs a dedicated redesign pass.
 
 ## Notes
 
 - The API must run in a shell with ROS sourced (`source /opt/ros/noetic/setup.bash` + your workspace).
 - Motion endpoints serialize via a non-blocking lock — concurrent motion requests get 409 "Robot is busy" rather than queuing.
-- Motions apply a path constraint keeping the end-effector aligned with the hardcoded target orientation (±0.5 rad tolerance) to prevent mid-path IK flips.
+- Motions apply an orientation path constraint (±0.5 rad) to prevent mid-path IK flips. Constraint is suppressed when `preserve_orientation=0` (so the wrist is allowed to freely reorient to the new target).
+- Motion endpoints auto-recover from reflex errors by default: on execute failure, `/franka_control/error_recovery` is called and the motion is retried once (configurable via `max_retries`). Recovery status is surfaced in the response (`recovery_triggered`, `recovery_succeeded`, `attempts`).
