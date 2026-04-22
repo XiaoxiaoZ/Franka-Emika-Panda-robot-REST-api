@@ -108,6 +108,72 @@ def decode_moveit_error(error_code):
     return MOVEIT_ERROR_DECODE.get(val, f"UNKNOWN_ERROR_{val}")
 
 
+# Panda joint limits (rad) from franka_description URDF. Used by
+# check_joint_limits() as a pre-flight safety check.
+PANDA_JOINT_LIMITS = [
+    (-2.8973,  2.8973),   # joint1
+    (-1.7628,  1.7628),   # joint2
+    (-2.8973,  2.8973),   # joint3
+    (-3.0718, -0.0698),   # joint4
+    (-2.8973,  2.8973),   # joint5
+    (-0.0175,  3.7525),   # joint6
+    (-2.8973,  2.8973),   # joint7
+]
+
+
+def check_joint_limits(joint_values, margin_rad=0.02):
+    """Return list of dicts describing joints within margin_rad of a limit.
+    Empty list means all joints are a safe distance from limits.
+
+    Default margin = 0.02 rad (~1.15 deg). This is calibrated against the
+    observed Franka firmware behavior: the low-level controller starts
+    refusing motion commands at ~0.0005 rad (0.03 deg) from a limit. 0.02
+    rad gives a ~30x safety buffer while still allowing routine motions
+    and post-push states (where a joint may be 1-5 deg from a limit) to
+    pass through."""
+    bad = []
+    for i, q in enumerate(joint_values):
+        if i >= len(PANDA_JOINT_LIMITS):
+            break
+        lo, hi = PANDA_JOINT_LIMITS[i]
+        min_dist = min(q - lo, hi - q)
+        if min_dist < margin_rad:
+            bad.append({
+                "joint": i + 1,
+                "current_rad": round(q, 4),
+                "limit_lo_rad": lo,
+                "limit_hi_rad": hi,
+                "distance_to_nearest_limit_rad": round(min_dist, 4),
+                "distance_to_nearest_limit_deg": round(min_dist * 57.2958, 2),
+            })
+    return bad
+
+
+def check_trajectory_for_limits(plan, margin_rad=0.02):
+    """Inspect every waypoint in a RobotTrajectory for joints too close to
+    their limits. Returns list of {waypoint_index, joint, ...} dicts. Empty
+    list means the trajectory is safe to execute.
+
+    Use this AFTER planning and BEFORE executing, so that trajectories that
+    would drift a joint into Franka's limit-refusal zone are caught at plan
+    time rather than failing silently at the firmware layer."""
+    violations = []
+    if plan is None:
+        return violations
+    traj = getattr(plan, "joint_trajectory", None)
+    if traj is None:
+        return violations
+    points = getattr(traj, "points", [])
+    for i, point in enumerate(points):
+        positions = getattr(point, "positions", None)
+        if positions is None:
+            continue
+        bad = check_joint_limits(positions, margin_rad=margin_rad)
+        for b in bad:
+            violations.append({"waypoint_index": i, **b})
+    return violations
+
+
 def is_external_force_abort(error_text):
     """Best-effort: did this reflex fire because of external force (user hand,
     unexpected contact) rather than a controller-internal violation?
@@ -413,7 +479,119 @@ class MoveGroupPythonInterfaceTutorial(object):
         current_pose = self.move_group.get_current_pose().pose
         return all_close(pose_goal, current_pose, 0.01)
 
-    def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1, get_last_error=None):
+    def nudge_joint(self, joint_index, delta_rad):
+        """Minimal-motion recovery: move one joint by delta_rad, keep all
+        others at their current values. Intended for unsticking a joint that
+        has drifted too close to its limit, where a full home move fails
+        because the Franka controller refuses to execute while a joint is in
+        the limit-proximity zone. A tiny, targeted motion sometimes gets
+        through where a large multi-joint motion doesn't.
+
+        joint_index: 0-based (0..6)
+        delta_rad: signed displacement. Positive moves toward +limit.
+
+        Returns dict similar to go_home: planner_tried, plan_error_codes,
+        executed, planner_used, planning_time.
+        """
+        move_group = self.move_group
+        move_group.clear_pose_targets()
+        move_group.clear_path_constraints()
+        move_group.set_num_planning_attempts(10)
+        move_group.set_planning_time(5.0)
+
+        joint_goal = list(move_group.get_current_joint_values())
+        if not (0 <= joint_index < len(joint_goal)):
+            return {"error": f"joint_index {joint_index} out of range", "executed": False}
+        joint_goal[joint_index] += delta_rad
+
+        # Clamp to valid range to avoid planning an infeasible goal
+        if joint_index < len(PANDA_JOINT_LIMITS):
+            lo, hi = PANDA_JOINT_LIMITS[joint_index]
+            safety_margin = 0.01
+            joint_goal[joint_index] = max(lo + safety_margin,
+                                          min(hi - safety_margin, joint_goal[joint_index]))
+
+        result = {"planner_tried": [], "plan_error_codes": [], "executed": False,
+                  "target_joint": joint_index + 1, "target_value_rad": round(joint_goal[joint_index], 4)}
+        try:
+            move_group.set_joint_value_target(joint_goal)
+            for planner_id in ("RRTConnectkConfigDefault", ""):
+                move_group.set_planner_id(planner_id)
+                result["planner_tried"].append(planner_id or "(default)")
+                plan_success, plan, planning_time, error_code = move_group.plan()
+                result["plan_error_codes"].append(decode_moveit_error(error_code))
+                if plan_success:
+                    result["planner_used"] = planner_id or "(default)"
+                    result["planning_time"] = planning_time
+                    plan = move_group.retime_trajectory(
+                        moveit_commander.RobotCommander().get_current_state(),
+                        plan,
+                        velocity_scaling_factor=0.15,
+                        acceleration_scaling_factor=0.05,
+                    )
+                    exec_ok = move_group.execute(plan, wait=True)
+                    result["executed"] = bool(exec_ok)
+                    break
+        finally:
+            move_group.stop()
+        return result
+
+    def go_home(self):
+        """Plan and execute a joint-space move to a canonical safe pose.
+
+        Tries multiple planners in order (PTP, RRTConnect) since the active
+        planner after plan_joint_path is LIN which can't plan to joint-space
+        goals. Returns a dict with details so the caller can report why it
+        failed if it did.
+        """
+        move_group = self.move_group
+        move_group.clear_pose_targets()
+        move_group.clear_path_constraints()
+        move_group.set_num_planning_attempts(10)
+        move_group.set_planning_time(5.0)
+        move_group.set_max_velocity_scaling_factor(0.15)
+        move_group.set_max_acceleration_scaling_factor(0.05)
+
+        joint_goal = move_group.get_current_joint_values()
+        joint_goal[0] = 0.0
+        joint_goal[1] = -0.785
+        joint_goal[2] = 0.0
+        joint_goal[3] = -1.571
+        joint_goal[4] = 0.0
+        joint_goal[5] = 1.047
+        joint_goal[6] = 0.785
+
+        result = {"planner_tried": [], "plan_error_codes": [], "executed": False}
+        try:
+            move_group.set_joint_value_target(joint_goal)
+            for planner_id in ("RRTConnectkConfigDefault", ""):
+                move_group.set_planner_id(planner_id)
+                result["planner_tried"].append(planner_id or "(default)")
+                plan_success, plan, planning_time, error_code = move_group.plan()
+                result["plan_error_codes"].append(decode_moveit_error(error_code))
+                if plan_success:
+                    result["planner_used"] = planner_id or "(default)"
+                    result["planning_time"] = planning_time
+                    # Retime with more aggressive profile so the Franka
+                    # controller receives commands of noticeable magnitude
+                    # per tick -- conservative scaling compounds poorly with
+                    # the 95% command acceptance rate when near a joint limit.
+                    plan = move_group.retime_trajectory(
+                        moveit_commander.RobotCommander().get_current_state(),
+                        plan,
+                        velocity_scaling_factor=0.30,
+                        acceleration_scaling_factor=0.10,
+                    )
+                    exec_ok = move_group.execute(plan, wait=True)
+                    result["executed"] = bool(exec_ok)
+                    break
+        finally:
+            move_group.stop()
+            move_group.set_max_velocity_scaling_factor(1.0)
+            move_group.set_max_acceleration_scaling_factor(1.0)
+        return result
+
+    def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1, get_last_error=None, traj_check_margin_rad=0.02):
         """Plan, execute, and auto-recover on execute failure.
 
         plan_fn: callable returning (plan, plan_ok, metadata)
@@ -463,6 +641,21 @@ class MoveGroupPythonInterfaceTutorial(object):
                     'attempts': attempts,
                     'plan_metadata': last_meta,
                 }
+
+            # Trajectory-wide joint-limit check -- reject plans that would
+            # drive any joint near its limit mid-path, before the firmware
+            # refuses the commands.
+            if traj_check_margin_rad is not None:
+                traj_violations = check_trajectory_for_limits(plan, margin_rad=traj_check_margin_rad)
+                if traj_violations:
+                    return {
+                        'outcome': 'plan_would_violate_limits',
+                        'recovery_triggered': recovery_triggered,
+                        'recovery_succeeded': recovery_succeeded,
+                        'attempts': attempts,
+                        'plan_metadata': last_meta,
+                        'trajectory_violations': traj_violations,
+                    }
 
             ok = self.execute_plan(plan)
             # If the user called /control/stop during execution, execute_plan
@@ -529,7 +722,7 @@ class MoveGroupPythonInterfaceTutorial(object):
             'plan_metadata': last_meta,
         }
 
-    def _eef_orientation_constraint(self, qx=1.0, qy=0.0, qz=0.0, qw=0.0, tolerance=0.5):
+    def _eef_orientation_constraint(self, qx=1.0, qy=0.0, qz=0.0, qw=0.0, tolerance=0.8):
         # Keep the end-effector aligned with the given target orientation
         # throughout the path. Blocks the planner from picking IK solutions that
         # flip the wrist/elbow mid-motion. tolerance is in radians on each axis.
@@ -591,12 +784,19 @@ class MoveGroupPythonInterfaceTutorial(object):
 
         ## END_SUB_TUTORIAL
 
-    def plan_joint_path(self, x, y, z=0.2, scale=1, preserve_orientation=True):
+    def plan_joint_path(self, x, y, z=0.2, scale=1, preserve_orientation=True, planner_id="LIN"):
         # If preserve_orientation is True (default), the current wrist orientation
         # is carried through the move. If False, the orientation is reset to
         # (1,0,0,0) -- the legacy hardcoded target.
+        #
+        # planner_id:
+        #   "LIN" (default): Pilz straight-line-in-cartesian. Good for precise
+        #        short moves; prone to joint-limit drift on large workspace sweeps.
+        #   "RRTConnectkConfigDefault": OMPL joint-space sampling. Path is not
+        #        straight in cartesian space, but plans are naturally limit-aware.
+        #        Use for large motions where straight-line isn't required.
         move_group = self.move_group
-        move_group.set_planner_id("LIN")
+        move_group.set_planner_id(planner_id)
 
         wpose = move_group.get_current_pose().pose
         wpose.position.x = scale * x

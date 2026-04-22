@@ -6,7 +6,7 @@ from flask import Flask, jsonify, request
 from threading import Lock
 
 # Log
-from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error
+from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits
 import rospy
 from rosgraph_msgs.msg import Log
 
@@ -263,6 +263,21 @@ def _parse_motion_args():
     return x, y, z, auto_recover, max_retries, preserve_orientation
 
 
+def _preflight_joint_limit_check():
+    """Return (ok, response_tuple). If ok is False, response_tuple is the
+    (json_body, status) to return immediately from the handler."""
+    joint_values = robot.move_group.get_current_joint_values()
+    near_limit = check_joint_limits(joint_values)
+    if near_limit:
+        return False, (jsonify({
+            "error": "joint_near_limit",
+            "msg": "one or more joints are too close to their limits; home the robot or freedrive it first",
+            "joints_near_limit": near_limit,
+            "hint": "call GET /control/home or use the Panda freedrive button to move the flagged joints away from their limits",
+        }), 400)
+    return True, None
+
+
 def _format_motion_response(outcome, extra=None):
     """Translate plan_and_execute_with_retry outcome dict into (json_body, status)."""
     body = {
@@ -285,6 +300,10 @@ def _format_motion_response(outcome, extra=None):
     if outcome['outcome'] == 'plan_failed':
         body["last_error"] = last_error[-1] if last_error else None
         return jsonify({**body, "msg": "Plan not 100%"}), 202
+    if outcome['outcome'] == 'plan_would_violate_limits':
+        body["trajectory_violations"] = outcome.get('trajectory_violations', [])
+        body["hint"] = "plan would drive a joint near its limit mid-path; try a different target, preserve_orientation=0, or plan_joint_path with planner_id=RRTConnectkConfigDefault"
+        return jsonify({**body, "msg": "plan rejected: would drift a joint past safe margin"}), 409
     if outcome['outcome'] == 'execute_failed':
         body["last_error"] = last_error[-1] if last_error else None
         return jsonify({**body, "msg": "execution failed"}), 500
@@ -294,26 +313,54 @@ def _format_motion_response(outcome, extra=None):
     return jsonify({**body, "msg": "unknown outcome"}), 500
 
 
+# Last requested motion, for /control/resume. Set at the start of each motion
+# handler and left in place across stops so the caller can explicitly resume.
+_last_motion = None
+
+
+def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation):
+    ok, rejection = _preflight_joint_limit_check()
+    if not ok:
+        return rejection
+
+    def plan_fn():
+        plan, fraction = robot.plan_cartesian_path(x, y, z, preserve_orientation=preserve_orientation)
+        return plan, fraction >= 1.0, {"fraction": fraction}
+
+    # Baseline so the classifier only considers errors that appear AFTER this
+    # motion starts. Fixes stale-classification bug where a previous stop's
+    # cartesian_reflex message was being re-matched on the next motion.
+    baseline = len(last_error)
+
+    def get_new_error():
+        return last_error[-1] if len(last_error) > baseline else None
+
+    outcome = robot.plan_and_execute_with_retry(
+        plan_fn,
+        auto_recover=auto_recover,
+        max_retries=max_retries,
+        get_last_error=get_new_error,
+    )
+    extra = {"fraction": str(outcome['plan_metadata'].get('fraction'))}
+    if outcome['outcome'] == 'plan_failed':
+        extra["moveit_error"] = f"PARTIAL_PATH (fraction={outcome['plan_metadata'].get('fraction')}, likely unreachable target or constraint too tight)"
+    return _format_motion_response(outcome, extra)
+
+
 def plan_cartesian_path():
     try:
         x, y, z, auto_recover, max_retries, preserve_orientation = _parse_motion_args()
     except (TypeError, ValueError):
         return jsonify({"error": "Error xy args"}), 400
 
-    def plan_fn():
-        plan, fraction = robot.plan_cartesian_path(x, y, z, preserve_orientation=preserve_orientation)
-        return plan, fraction >= 1.0, {"fraction": fraction}
+    global _last_motion
+    _last_motion = {
+        'kind': 'cartesian', 'x': x, 'y': y, 'z': z,
+        'auto_recover': auto_recover, 'max_retries': max_retries,
+        'preserve_orientation': preserve_orientation,
+    }
 
-    outcome = robot.plan_and_execute_with_retry(
-        plan_fn,
-        auto_recover=auto_recover,
-        max_retries=max_retries,
-        get_last_error=lambda: last_error[-1] if last_error else None,
-    )
-    extra = {"fraction": str(outcome['plan_metadata'].get('fraction'))}
-    if outcome['outcome'] == 'plan_failed':
-        extra["moveit_error"] = f"PARTIAL_PATH (fraction={outcome['plan_metadata'].get('fraction')}, likely unreachable target or constraint too tight)"
-    return _format_motion_response(outcome, extra)
+    return _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation)
 
 
 @app.route('/control/plan_cartesian_path', methods = ['GET'])
@@ -324,26 +371,50 @@ def plan_cartesian_path_impl():
     finally: moveit_lock.release()
 
 
-def plan_joint_path():
-    try:
-        x, y, z, auto_recover, max_retries, preserve_orientation = _parse_motion_args()
-    except (TypeError, ValueError):
-        return jsonify({"error": "Error xy args"}), 400
+def _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_id="LIN"):
+    ok, rejection = _preflight_joint_limit_check()
+    if not ok:
+        return rejection
 
     def plan_fn():
-        (plan_success, plan, planning_time, error_code) = robot.plan_joint_path(x, y, z, preserve_orientation=preserve_orientation)
-        return plan, bool(plan_success), {"planning_time": planning_time, "error_code": error_code}
+        (plan_success, plan, planning_time, error_code) = robot.plan_joint_path(
+            x, y, z, preserve_orientation=preserve_orientation, planner_id=planner_id,
+        )
+        return plan, bool(plan_success), {"planning_time": planning_time, "error_code": error_code, "planner_id": planner_id}
+
+    baseline = len(last_error)
+
+    def get_new_error():
+        return last_error[-1] if len(last_error) > baseline else None
 
     outcome = robot.plan_and_execute_with_retry(
         plan_fn,
         auto_recover=auto_recover,
         max_retries=max_retries,
-        get_last_error=lambda: last_error[-1] if last_error else None,
+        get_last_error=get_new_error,
     )
     extra = {"planning_time": str(outcome['plan_metadata'].get('planning_time'))}
     if outcome['outcome'] == 'plan_failed':
         extra["moveit_error"] = decode_moveit_error(outcome['plan_metadata'].get('error_code'))
     return _format_motion_response(outcome, extra)
+
+
+def plan_joint_path():
+    try:
+        x, y, z, auto_recover, max_retries, preserve_orientation = _parse_motion_args()
+        planner_id = request.args.get("planner_id", "LIN")
+    except (TypeError, ValueError):
+        return jsonify({"error": "Error xy args"}), 400
+
+    global _last_motion
+    _last_motion = {
+        'kind': 'joint', 'x': x, 'y': y, 'z': z,
+        'auto_recover': auto_recover, 'max_retries': max_retries,
+        'preserve_orientation': preserve_orientation,
+        'planner_id': planner_id,
+    }
+
+    return _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_id=planner_id)
 
 
 @app.route('/control/plan_joint_path', methods = ['GET'])
@@ -352,6 +423,87 @@ def plan_joint_path_impl():
         return jsonify({"error": "Robot is busy"}), 409
     try: return plan_joint_path()
     finally: moveit_lock.release()
+@app.route('/control/resume', methods = ['GET'])
+def resume_impl():
+    """Re-issue the last requested motion from the robot's current position.
+    Useful after a stopped/stopped_external_force outcome when the caller
+    wants the arm to complete the motion that was interrupted. Uses the same
+    planner kind, target, and settings as the last motion request.
+
+    Always calls /franka_control/error_recovery first to clear any lingering
+    reflex state from the previous stop. Without this, the controller silently
+    refuses the new execute and the resume plan fails with no new error."""
+    global _last_motion
+    if _last_motion is None:
+        return jsonify({
+            "error": "no_motion_to_resume",
+            "msg": "no prior motion request has been issued since server start",
+        }), 400
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try:
+        # Clear reflex error state from previous stop so the new execute
+        # isn't silently refused by the controller.
+        robot.recover()
+        lm = _last_motion
+        if lm['kind'] == 'cartesian':
+            return _do_cartesian(lm['x'], lm['y'], lm['z'],
+                                 lm['auto_recover'], lm['max_retries'], lm['preserve_orientation'])
+        if lm['kind'] == 'joint':
+            return _do_joint(lm['x'], lm['y'], lm['z'],
+                             lm['auto_recover'], lm['max_retries'], lm['preserve_orientation'],
+                             planner_id=lm.get('planner_id', 'LIN'))
+        return jsonify({"error": f"unknown cached motion kind: {lm.get('kind')}"}), 500
+    finally:
+        moveit_lock.release()
+
+@app.route('/control/nudge_joint', methods = ['GET'])
+def nudge_joint_impl():
+    """Minimal-motion recovery for a single joint. Bypasses the pre-flight
+    joint-limit check because this endpoint IS the recovery tool for that."""
+    try:
+        joint_1based = int(request.args.get("joint"))
+        delta_rad = float(request.args.get("delta"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "missing or bad 'joint' (1..7) or 'delta' (rad) param"}), 400
+    if not (1 <= joint_1based <= 7):
+        return jsonify({"error": "joint must be 1..7"}), 400
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try:
+        result = robot.nudge_joint(joint_1based - 1, delta_rad)
+        status_code = 200 if result.get("executed") else 500
+        return jsonify({
+            "status": "nudged" if result.get("executed") else "failed",
+            **result,
+            "last_error": last_error[-1] if last_error else None,
+        }), status_code
+    finally:
+        moveit_lock.release()
+
+@app.route('/control/home', methods = ['GET'])
+def home_impl():
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try:
+        result = robot.go_home()
+        if result.get("executed"):
+            return jsonify({
+                "status": "homed",
+                "msg": "arm moved to canonical joint pose",
+                "planner_used": result.get("planner_used"),
+                "planning_time": str(result.get("planning_time")),
+            }), 200
+        return jsonify({
+            "status": "failed",
+            "msg": "home motion failed",
+            "planner_tried": result.get("planner_tried"),
+            "plan_error_codes": result.get("plan_error_codes"),
+            "last_error": last_error[-1] if last_error else None,
+        }), 500
+    finally:
+        moveit_lock.release()
+
 @app.route('/health', methods = ['GET'])
 def health():
     return jsonify({
