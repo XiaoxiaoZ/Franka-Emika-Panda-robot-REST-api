@@ -1,5 +1,7 @@
 # Using flask to make an api
 # import necessary libraries and functions
+import logging
+import os
 from flask import Flask, jsonify, request
 from threading import Lock
 
@@ -12,6 +14,12 @@ import actionlib
 from franka_gripper.msg import MoveAction, MoveGoal, GraspAction, GraspGoal
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+)
+log = logging.getLogger('franka_restful')
+
 last_error = []
 def rosout_cd(msg):
     global last_error
@@ -21,6 +29,11 @@ rospy.Subscriber("/rosout", Log, rosout_cd)
 
 # creating a Flask app
 app = Flask(__name__)
+
+@app.errorhandler(Exception)
+def _on_unhandled_exception(e):
+    log.exception("Unhandled exception in handler")
+    return jsonify({"error": type(e).__name__, "message": str(e)}), 500
 
 # robot instance
 robot = MoveGroupPythonInterfaceTutorial()
@@ -104,7 +117,7 @@ def go_to_gripper_state():
         result = robot.go_to_gripper_state(width)
         return jsonify({'result': result}), 200
     except Exception as error:
-        return jsonify({'error': error}), 500      
+        return jsonify({'error': str(error)}), 500
 @app.route('/control/go_to_gripper_state', methods = ['GET'])
 def go_to_gripper_state_impl():
     if not moveit_lock.acquire(blocking=False):
@@ -117,14 +130,14 @@ def gripper_open():
         result = robot.go_to_gripper_state(0.1)
         return jsonify({'result': result}), 200
     except Exception as error:
-        return jsonify({'error': error}), 500   
+        return jsonify({'error': str(error)}), 500
 
 def gripper_close():
     try:
         result = robot.go_to_gripper_state(0.01)
         return jsonify({'result': result}), 200
     except Exception as error:
-        return jsonify({'error': error}), 500   
+        return jsonify({'error': str(error)}), 500
     
 def gripper_open1():
     """
@@ -258,9 +271,20 @@ def plan_joint_path_impl():
         return jsonify({"error": "Robot is busy"}), 409
     try: return plan_joint_path()
     finally: moveit_lock.release()
+@app.route('/health', methods = ['GET'])
+def health():
+    return jsonify({
+        "move_server": bool(gripper_move_client.wait_for_server(rospy.Duration(0.1))),
+        "grasp_server": bool(gripper_grasp_client.wait_for_server(rospy.Duration(0.1))),
+        "lock_busy": moveit_lock.locked(),
+        "last_error": last_error[-1] if last_error else None,
+    }), 200
+
 @app.route('/recover', methods = ['GET'])
 def recover():
-    robot.recover()
+    ok = robot.recover()
+    if not ok:
+        return jsonify({"status": "timeout", "error": "recovery did not complete within timeout"}), 504
     return jsonify({"status": "recovered","msg": "Robot recovered"}), 200
 
 @app.route('/control/stop', methods = ['GET'])
@@ -269,5 +293,7 @@ def stop():
     return jsonify({"status": "stopped","msg": "Robot stopped"}), 200
 # driver function
 if __name__ == '__main__':
-    #app.run(host="192.168.0.102", port=5000, debug = True)
-    app.run(host="172.26.0.212", port=5000, debug = True)
+    host = os.environ.get('FRANKA_RESTFUL_HOST', '172.26.0.212')
+    port = int(os.environ.get('FRANKA_RESTFUL_PORT', '5000'))
+    log.info(f"Starting Flask on {host}:{port} (override with FRANKA_RESTFUL_HOST / FRANKA_RESTFUL_PORT)")
+    app.run(host=host, port=port, debug=True)

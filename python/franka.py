@@ -192,27 +192,28 @@ class MoveGroupPythonInterfaceTutorial(object):
         self.planning_frame = planning_frame
         self.eef_link = eef_link
         self.group_names = group_names
-    def recover(self, wait=True, timeout=None):
+    def recover(self, wait=True, timeout=rospy.Duration(15.0)):
         """
         Trigger Franka automatic error recovery once.
         - wait: block until done
-        - timeout: rospy.Duration, e.g. rospy.Duration(5.0)
+        - timeout: rospy.Duration, default 15 s. Previously defaulted to None (indefinite wait).
+        Returns True on success, False on server-unavailable or result timeout.
         """
-        action_name="/franka_control/error_recovery"
+        action_name = "/franka_control/error_recovery"
         client = actionlib.SimpleActionClient(action_name, ErrorRecoveryAction)
         rospy.loginfo(f"Waiting for {action_name} action server...")
-        client.wait_for_server()
+        if not client.wait_for_server(rospy.Duration(10.0)):
+            rospy.logerr(f"{action_name} not available after 10s")
+            return False
         rospy.loginfo("Franka error recovery server ready.")
         goal = ErrorRecoveryGoal()  # empty goal
         client.send_goal(goal)
 
         if wait:
-            if timeout is None:
-                client.wait_for_result()
-                return True
-            else:
-                ok = client.wait_for_result(timeout)
-                return bool(ok)
+            ok = client.wait_for_result(timeout)
+            if not ok:
+                rospy.logerr(f"{action_name} did not return within {timeout.to_sec()}s")
+            return bool(ok)
         return True
     
     def go_to_joint_state(self):
@@ -359,6 +360,25 @@ class MoveGroupPythonInterfaceTutorial(object):
         current_pose = self.move_group.get_current_pose().pose
         return all_close(pose_goal, current_pose, 0.01)
 
+    def _eef_orientation_constraint(self, tolerance=0.5):
+        # Keep the end-effector aligned with the target orientation (1,0,0,0)
+        # throughout the path. Blocks the planner from picking IK solutions that
+        # flip the wrist/elbow mid-motion. tolerance is in radians on each axis.
+        oc = moveit_msgs.msg.OrientationConstraint()
+        oc.link_name = self.move_group.get_end_effector_link()
+        oc.header.frame_id = self.move_group.get_planning_frame()
+        oc.orientation.x = 1.0
+        oc.orientation.y = 0.0
+        oc.orientation.z = 0.0
+        oc.orientation.w = 0.0
+        oc.absolute_x_axis_tolerance = tolerance
+        oc.absolute_y_axis_tolerance = tolerance
+        oc.absolute_z_axis_tolerance = tolerance
+        oc.weight = 1.0
+        constraints = moveit_msgs.msg.Constraints()
+        constraints.orientation_constraints.append(oc)
+        return constraints
+
     def plan_cartesian_path(self, x, y, z=0.2, scale=1):
         # Copy class variables to local variables to make the web tutorials more clear.
         # In practice, you should use the class variables directly unless you have a good
@@ -376,9 +396,9 @@ class MoveGroupPythonInterfaceTutorial(object):
         waypoints = []
 
         wpose = move_group.get_current_pose().pose
-        wpose.position.x = scale * x  # 
-        wpose.position.y = scale * y  # 
-        wpose.position.z = scale * z  # 
+        wpose.position.x = scale * x  #
+        wpose.position.y = scale * y  #
+        wpose.position.z = scale * z  #
         wpose.orientation.x = 1.0
         wpose.orientation.y = 0.0
         wpose.orientation.z = 0.0
@@ -386,25 +406,27 @@ class MoveGroupPythonInterfaceTutorial(object):
         waypoints.append(copy.deepcopy(wpose))
 
         #print(wpose)
-        # We want the Cartesian path to be interpolated at a resolution of 1 cm
-        # which is why we will specify 0.01 as the eef_step in Cartesian
-        # translation.  We will disable the jump threshold by setting it to 0.0,
-        # ignoring the check for infeasible jumps in joint space, which is sufficient
-        # for this tutorial.
-        (plan, fraction) = move_group.compute_cartesian_path(
-            waypoints, 0.01  # waypoints to follow  # eef_step
-        )
+        # eef_step=0.01: interpolate Cartesian path at 1 cm resolution.
+        # Note: jump_threshold is not exposed by this MoveIt build. Use an
+        # orientation path constraint instead to keep IK continuous.
+        move_group.set_path_constraints(self._eef_orientation_constraint())
+        try:
+            (plan, fraction) = move_group.compute_cartesian_path(
+                waypoints, 0.01
+            )
+        finally:
+            move_group.clear_path_constraints()
 
         #set speed
         velocity_scaling_factor = 0.05
-        plan = move_group.retime_trajectory(moveit_commander.RobotCommander().get_current_state(), 
-                                       plan, 
+        plan = move_group.retime_trajectory(moveit_commander.RobotCommander().get_current_state(),
+                                       plan,
                                        velocity_scaling_factor)
         # Note: We are just planning, not asking move_group to actually move the robot yet:
         return plan, fraction
 
         ## END_SUB_TUTORIAL
-    
+
     def plan_joint_path(self, x, y, z=0.2, scale=1):
         # Copy class variables to local variables to make the web tutorials more clear.
         # In practice, you should use the class variables directly unless you have a good
@@ -422,21 +444,21 @@ class MoveGroupPythonInterfaceTutorial(object):
 
 
         wpose = move_group.get_current_pose().pose
-        wpose.position.x = scale * x  # 
-        wpose.position.y = scale * y  # 
-        wpose.position.z = scale * z  # 
+        wpose.position.x = scale * x  #
+        wpose.position.y = scale * y  #
+        wpose.position.z = scale * z  #
         wpose.orientation.x = 1.0
         wpose.orientation.y = 0.0
         wpose.orientation.z = 0.0
         wpose.orientation.w = 0.0
         move_group.set_pose_target(wpose)
-        #print(wpose)
-        # We want the Cartesian path to be interpolated at a resolution of 1 cm
-        # which is why we will specify 0.01 as the eef_step in Cartesian
-        # translation.  We will disable the jump threshold by setting it to 0.0,
-        # ignoring the check for infeasible jumps in joint space, which is sufficient
-        # for this tutorial.
-        (plan_success, plan, planning_time, error_code) = move_group.plan()
+        move_group.set_num_planning_attempts(10)
+        move_group.set_planning_time(5.0)
+        move_group.set_path_constraints(self._eef_orientation_constraint())
+        try:
+            (plan_success, plan, planning_time, error_code) = move_group.plan()
+        finally:
+            move_group.clear_path_constraints()
         print(plan_success, planning_time, error_code)
         #set speed
         velocity_scaling_factor = 0.30
