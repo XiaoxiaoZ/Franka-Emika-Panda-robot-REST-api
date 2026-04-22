@@ -139,54 +139,159 @@ def gripper_close():
     except Exception as error:
         return jsonify({'error': str(error)}), 500
     
+def _gripper_action_call(client, server_name, goal, timeout_s, auto_recover, max_retries):
+    """Run a gripper action with optional auto-recovery retry.
+
+    On action timeout or action-reported failure: optionally call
+    robot.recover() and resend the goal up to max_retries times.
+
+    WARNING for transit scenarios (gripper is currently holding an object
+    during arm motion and you are issuing a new gripper action): pass
+    max_retries=0 to prevent a reset-and-retry cycle that could disturb
+    the grasp.
+
+    Returns dict with: outcome, attempts, recovery_triggered,
+    recovery_succeeded, result (the action result msg, may be None).
+    """
+    if not client.wait_for_server(rospy.Duration(1.0)):
+        return {
+            'outcome': 'server_unreachable',
+            'attempts': 0,
+            'recovery_triggered': False,
+            'recovery_succeeded': False,
+            'result': None,
+            'error': f'{server_name} action server not reachable',
+        }
+
+    recovery_triggered = False
+    recovery_succeeded = False
+    attempts = 0
+    last_err = None
+    last_result = None
+
+    while attempts <= max_retries:
+        attempts += 1
+        client.send_goal(goal)
+        finished = client.wait_for_result(rospy.Duration(timeout_s))
+        if not finished:
+            client.cancel_goal()
+            last_err = f'{server_name} timed out after {timeout_s}s'
+            if not auto_recover or attempts > max_retries:
+                return {
+                    'outcome': 'action_timeout',
+                    'attempts': attempts,
+                    'recovery_triggered': recovery_triggered,
+                    'recovery_succeeded': recovery_succeeded,
+                    'result': None,
+                    'error': last_err,
+                }
+            recovery_triggered = True
+            recovery_succeeded = robot.recover()
+            if not recovery_succeeded:
+                return {
+                    'outcome': 'recovery_failed',
+                    'attempts': attempts,
+                    'recovery_triggered': True,
+                    'recovery_succeeded': False,
+                    'result': None,
+                    'error': last_err,
+                }
+            continue
+
+        last_result = client.get_result()
+        ok = last_result is not None and bool(getattr(last_result, "success", False))
+        if ok:
+            return {
+                'outcome': 'success',
+                'attempts': attempts,
+                'recovery_triggered': recovery_triggered,
+                'recovery_succeeded': recovery_succeeded,
+                'result': last_result,
+            }
+        last_err = getattr(last_result, "error", "action reported failure") if last_result else "no result"
+        if not auto_recover or attempts > max_retries:
+            return {
+                'outcome': 'action_failed',
+                'attempts': attempts,
+                'recovery_triggered': recovery_triggered,
+                'recovery_succeeded': recovery_succeeded,
+                'result': last_result,
+                'error': last_err,
+            }
+        recovery_triggered = True
+        recovery_succeeded = robot.recover()
+        if not recovery_succeeded:
+            return {
+                'outcome': 'recovery_failed',
+                'attempts': attempts,
+                'recovery_triggered': True,
+                'recovery_succeeded': False,
+                'result': last_result,
+                'error': last_err,
+            }
+
+    return {
+        'outcome': 'action_failed',
+        'attempts': attempts,
+        'recovery_triggered': recovery_triggered,
+        'recovery_succeeded': recovery_succeeded,
+        'result': last_result,
+        'error': last_err,
+    }
+
+
+def _gripper_status_code(outcome):
+    return {
+        'success': 200,
+        'action_timeout': 504,
+        'server_unreachable': 503,
+        'action_failed': 500,
+        'recovery_failed': 500,
+    }.get(outcome, 500)
+
+
 def gripper_open1():
     """
     Open the gripper using franka_gripper/move.
-    Optional query params:
-      width: target opening in meters (default 0.08)
-      speed: opening speed in m/s (default 0.1)
-      timeout: seconds to wait for result (default 10.0)
+    Query params:
+      width (default 0.08), speed (0.1), timeout (10.0)
+      auto_recover (1), max_retries (1) -- pass max_retries=0 for transit scenarios
     """
     try:
-        width = float(request.args.get("width", "0.08"))  # Panda max ≈ 0.08 m
+        width = float(request.args.get("width", "0.08"))
         speed = float(request.args.get("speed", "0.1"))
         timeout_s = float(request.args.get("timeout", "10.0"))
+        auto_recover = request.args.get("auto_recover", "1") != "0"
+        max_retries = int(request.args.get("max_retries", "1"))
     except (TypeError, ValueError):
-        return jsonify({"error": "Bad width/speed/timeout params"}), 400
-
-    if not gripper_move_client.wait_for_server(rospy.Duration(1.0)):
-        return jsonify({"error": "franka_gripper/move action server not reachable"}), 503
+        return jsonify({"error": "Bad width/speed/timeout/auto_recover/max_retries params"}), 400
 
     goal = MoveGoal()
     goal.width = width
     goal.speed = speed
 
-    gripper_move_client.send_goal(goal)
-    finished = gripper_move_client.wait_for_result(rospy.Duration(timeout_s))
-    if not finished:
-        gripper_move_client.cancel_goal()
-        return jsonify({"error": f"franka_gripper move timed out after {timeout_s}s"}), 504
-    result = gripper_move_client.get_result()
-
-    ok = result is not None and bool(getattr(result, "success", False))
+    outcome = _gripper_action_call(
+        gripper_move_client, "franka_gripper/move", goal, timeout_s,
+        auto_recover=auto_recover, max_retries=max_retries,
+    )
     return jsonify({
-        "success": ok,
-        "error_msg": None if ok else getattr(result, "error", "no result"),
+        "outcome": outcome['outcome'],
+        "success": outcome['outcome'] == 'success',
+        "attempts": outcome['attempts'],
+        "recovery_triggered": outcome['recovery_triggered'],
+        "recovery_succeeded": outcome['recovery_succeeded'] if outcome['recovery_triggered'] else None,
         "final_width_cmd": float(width),
-    }), 200 if ok else 500
+        "error_msg": outcome.get('error'),
+    }), _gripper_status_code(outcome['outcome'])
 
 
 def gripper_close1():
     """
-    Close the gripper until it senses an object, using franka_gripper/grasp.
-
-    Optional query params:
-      width: expected object width (m). Use 0.0 if unknown (close fully until contact)
-      speed: closing speed (m/s, default 0.05)
-      force: grip force (N, default 20.0)
-      eps_in: epsilon.inner, allowed inner tolerance (default 0.005)
-      eps_out: epsilon.outer, allowed outer tolerance (default 0.005)
-      timeout: seconds to wait for result (default 10.0)
+    Close the gripper using franka_gripper/grasp.
+    Query params:
+      width (default 0.0 = close until contact), speed (0.05), force (20.0),
+      eps_in (0.005), eps_out (0.005), timeout (10.0)
+      auto_recover (1), max_retries (1) -- pass max_retries=0 for transit scenarios
     """
     try:
         width = float(request.args.get("width", "0.0"))
@@ -195,11 +300,10 @@ def gripper_close1():
         eps_in = float(request.args.get("eps_in", "0.005"))
         eps_out = float(request.args.get("eps_out", "0.005"))
         timeout_s = float(request.args.get("timeout", "10.0"))
+        auto_recover = request.args.get("auto_recover", "1") != "0"
+        max_retries = int(request.args.get("max_retries", "1"))
     except (TypeError, ValueError):
         return jsonify({"error": "Bad grasp params"}), 400
-
-    if not gripper_grasp_client.wait_for_server(rospy.Duration(1.0)):
-        return jsonify({"error": "franka_gripper/grasp action server not reachable"}), 503
 
     goal = GraspGoal()
     goal.width = width
@@ -208,20 +312,20 @@ def gripper_close1():
     goal.epsilon.inner = eps_in
     goal.epsilon.outer = eps_out
 
-    gripper_grasp_client.send_goal(goal)
-    finished = gripper_grasp_client.wait_for_result(rospy.Duration(timeout_s))
-    if not finished:
-        gripper_grasp_client.cancel_goal()
-        return jsonify({"error": f"franka_gripper grasp timed out after {timeout_s}s"}), 504
-    result = gripper_grasp_client.get_result()
-
-    ok = result is not None and bool(getattr(result, "success", False))
+    outcome = _gripper_action_call(
+        gripper_grasp_client, "franka_gripper/grasp", goal, timeout_s,
+        auto_recover=auto_recover, max_retries=max_retries,
+    )
     return jsonify({
-        "success": ok,
-        "error_msg": None if ok else getattr(result, "error", "no result"),
+        "outcome": outcome['outcome'],
+        "success": outcome['outcome'] == 'success',
+        "attempts": outcome['attempts'],
+        "recovery_triggered": outcome['recovery_triggered'],
+        "recovery_succeeded": outcome['recovery_succeeded'] if outcome['recovery_triggered'] else None,
         "used_width_cmd": float(width),
-        "force": float(force)
-    }), 200 if ok else 500
+        "force": float(force),
+        "error_msg": outcome.get('error'),
+    }), _gripper_status_code(outcome['outcome'])
 
 @app.route('/control/gripper_open', methods = ['GET'])
 def gripper_open_impl():

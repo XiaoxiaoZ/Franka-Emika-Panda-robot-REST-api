@@ -52,11 +52,15 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 - `GET /control/gripper_open` / `GET /control/gripper_close`
   MoveIt-based gripper control — shortcut for opening (0.1 m) / closing (0.01 m). No force feedback.
 
-- `GET /control/gripper_open_force?width=<m>&speed=<m/s>&timeout=<s>`
+- `GET /control/gripper_open_force?width=<m>&speed=<m/s>&timeout=<s>&auto_recover=0/1&max_retries=N`
   Force-based open via `/franka_gripper/move`. Timeout defaults to 10 s; returns 504 on timeout.
+  Shares the recovery wrapper with `/control/gripper_grasp` (same query params, same response fields: `outcome`, `attempts`, `recovery_triggered`, `recovery_succeeded`).
 
-- `GET /control/gripper_grasp?width=<m>&speed=<m/s>&force=<N>&eps_in=<m>&eps_out=<m>&timeout=<s>`
+- `GET /control/gripper_grasp?width=<m>&speed=<m/s>&force=<N>&eps_in=<m>&eps_out=<m>&timeout=<s>&auto_recover=0/1&max_retries=N`
   Force-based grasp via `/franka_gripper/grasp`. Use `width=0.0` to close until contact; widen `eps_out` (e.g. 0.08) for unknown object widths to get correct success reporting.
+  On failure (timeout or action-reported failure), the wrapper optionally calls `/franka_control/error_recovery` and retries up to `max_retries` times.
+  **For transit scenarios** (gripper is holding an object mid-transport and you're issuing a new gripper action), pass `max_retries=0` to guarantee no reset-and-retry that might disturb the grasp.
+  Outcomes: `success`, `action_timeout` (504), `action_failed` (500), `recovery_failed` (500), `server_unreachable` (503).
 
 - `GET /control/stop`
   Stop any ongoing motion and clear the current plan. Sets a stop flag that suppresses the auto-recovery retry, so the in-flight motion request returns `outcome: stopped` (not `execute_failed`) and does not resume.
@@ -120,7 +124,7 @@ FRANKA_RESTFUL_HOST=0.0.0.0 python3 python/restful.py
 Some parts of this codebase are known-limited or known-broken. Expect follow-up work:
 
 - **`python/handshake_server.py` — legacy.** A FastAPI state-variable bridge on port 5001. Poll-loops over HTTP back into `restful.py`. Its original use case may no longer apply; kept in place pending a decision to delete or rewrite.
-- **Gripper auto-recovery — not implemented.** The motion endpoints auto-recover from reflex errors. The gripper endpoints don't, because correct gripper recovery depends on context (mid-pick vs mid-transit vs mid-release) and needs a dedicated design pass.
+- **Gripper auto-recovery** — implemented as a generic retry wrapper (`_gripper_action_call`). On failure or timeout, optionally calls `/franka_control/error_recovery` and retries the action. Default is one retry. **Context-awareness is the caller's responsibility:** for transit scenarios (gripper already holding an object mid-transport), pass `max_retries=0` to avoid a reset-and-retry that could disturb the grasp.
 - **Simulation / scene API — basic.** `/simulation/add_box` hardcodes a single fixed-size cube; `self.box_name` is a single slot that `add_floor()` overwrites, which can cause `/simulation/remove_box` to remove the wrong object. No shape/size/pose parameters. Scene mutations don't take the motion lock. Needs a dedicated redesign pass.
 
 ## Notes
