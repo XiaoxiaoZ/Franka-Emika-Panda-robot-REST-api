@@ -227,6 +227,9 @@ class MoveGroupPythonInterfaceTutorial(object):
         self.planning_frame = planning_frame
         self.eef_link = eef_link
         self.group_names = group_names
+        # Set by stop() to signal in-flight motion loops not to auto-retry.
+        # Cleared by plan_and_execute_with_retry at start of each motion.
+        self._stop_requested = False
     def recover(self, wait=True, timeout=rospy.Duration(15.0)):
         """
         Trigger Franka automatic error recovery once.
@@ -421,6 +424,8 @@ class MoveGroupPythonInterfaceTutorial(object):
         recovery_succeeded = False
         attempts = 0
         last_meta = {}
+        # Clear any stop flag from a previous motion so this call starts clean.
+        self._stop_requested = False
 
         while attempts <= max_retries:
             attempts += 1
@@ -438,6 +443,17 @@ class MoveGroupPythonInterfaceTutorial(object):
                 }
 
             ok = self.execute_plan(plan)
+            # If the user called /control/stop during execution, execute_plan
+            # will have returned False due to the aborted trajectory. Do NOT
+            # auto-retry in that case -- the stop was intentional.
+            if self._stop_requested:
+                return {
+                    'outcome': 'stopped',
+                    'recovery_triggered': recovery_triggered,
+                    'recovery_succeeded': recovery_succeeded,
+                    'attempts': attempts,
+                    'plan_metadata': last_meta,
+                }
             if ok:
                 return {
                     'outcome': 'success',
@@ -818,6 +834,9 @@ class MoveGroupPythonInterfaceTutorial(object):
             box_is_attached=False, box_is_known=False, timeout=timeout
         )
     def stop(self):
+        # Signal any in-flight plan_and_execute_with_retry loop to treat the
+        # aborted execute as user-initiated and skip auto-retry.
+        self._stop_requested = True
         move_group = self.move_group
         move_group.stop()
         move_group.clear_pose_targets()

@@ -276,6 +276,8 @@ def _format_motion_response(outcome, extra=None):
 
     if outcome['outcome'] == 'success':
         return jsonify({**body, "msg": "Plan 100%"}), 200
+    if outcome['outcome'] == 'stopped':
+        return jsonify({**body, "msg": "motion stopped by user /control/stop"}), 200
     if outcome['outcome'] == 'plan_failed':
         body["last_error"] = last_error[-1] if last_error else None
         return jsonify({**body, "msg": "Plan not 100%"}), 202

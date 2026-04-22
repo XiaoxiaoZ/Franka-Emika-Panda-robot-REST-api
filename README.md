@@ -59,7 +59,7 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
   Force-based grasp via `/franka_gripper/grasp`. Use `width=0.0` to close until contact; widen `eps_out` (e.g. 0.08) for unknown object widths to get correct success reporting.
 
 - `GET /control/stop`
-  Stop any ongoing motion and clear the current plan.
+  Stop any ongoing motion and clear the current plan. Sets a stop flag that suppresses the auto-recovery retry, so the in-flight motion request returns `outcome: stopped` (not `execute_failed`) and does not resume.
 
 - `GET /recover`
   Trigger Franka automatic error recovery. Returns 504 if recovery doesn't complete within 15 s.
