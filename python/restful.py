@@ -2,11 +2,14 @@
 # import necessary libraries and functions
 import logging
 import os
+import signal
 from flask import Flask, jsonify, request
 from threading import Lock
 
 # Log
 from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits, is_user_stop_abort
+from force_viz import ForceVisualizer
+from payload_id import PayloadIdentifier
 import rospy
 from rosgraph_msgs.msg import Log
 
@@ -30,6 +33,11 @@ rospy.Subscriber("/rosout", Log, rosout_cd)
 # creating a Flask app
 app = Flask(__name__)
 
+# Flask debug mode (and its auto-reloader). The reloader re-executes this
+# module in a child process, so module-level singletons are built twice unless
+# guarded -- see the force_viz guard below. Override with FRANKA_RESTFUL_DEBUG=0.
+DEBUG = os.environ.get('FRANKA_RESTFUL_DEBUG', '1') != '0'
+
 @app.errorhandler(Exception)
 def _on_unhandled_exception(e):
     log.exception("Unhandled exception in handler")
@@ -52,6 +60,21 @@ if not gripper_grasp_client.wait_for_server(rospy.Duration(10.0)):
     rospy.logerr("franka_gripper/grasp action server not available after 10s")
 rospy.loginfo("franka_gripper action servers are ready (or timed out).")
 robot.add_floor()
+
+# End-effector force visualization: subscribes to /franka_state_controller/F_ext
+# and publishes an arrow+label MarkerArray to /franka_ee_force for RViz.
+# Build it only in the process that serves requests: under the debug reloader
+# the module is imported twice (supervisor + worker) and only the worker has
+# WERKZEUG_RUN_MAIN set; without this guard RViz would see two publishers on
+# /franka_ee_force (flicker, and tare/config appear not to take effect because
+# the supervisor's stale instance keeps republishing). With the reloader off
+# (DEBUG=0) the env var is unset and we build it normally.
+if (not DEBUG) or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+    force_viz = ForceVisualizer()
+    payload_identifier = PayloadIdentifier(robot, force_viz.get_force)
+else:
+    force_viz = None
+    payload_identifier = None
 
 # on the terminal type: curl http://127.0.0.1:5000/
 # returns hello world when we use GET.
@@ -622,6 +645,129 @@ def home_impl():
     finally:
         moveit_lock.release()
 
+@app.route('/force', methods = ['GET'])
+def force():
+    """Current end-effector external wrench estimate.
+    Returns raw/net force and torque (after tare), their magnitudes, the lever
+    arm (|net torque| / |net force|, ~CoM offset of a held object), and frame.
+    Lock-free: reading force never blocks on (or blocks) robot motion."""
+    data = force_viz.get_force()
+    return jsonify(data), 200 if data.get("available") else 503
+
+@app.route('/force/tare', methods = ['GET'])
+def force_tare():
+    """Zero the force display: snapshot the current raw force as the baseline
+    so a subsequently grasped object's weight shows on its own. Tare with an
+    empty gripper for best results."""
+    baseline = force_viz.tare()
+    if baseline is None:
+        return jsonify({
+            "status": "no_data",
+            "msg": "no wrench received yet; cannot tare",
+        }), 503
+    return jsonify({"status": "tared", "baseline": baseline}), 200
+
+@app.route('/force/untare', methods = ['GET'])
+def force_untare():
+    """Clear the baseline so the raw F_ext value is shown again."""
+    force_viz.untare()
+    return jsonify({"status": "untared", "msg": "baseline cleared"}), 200
+
+@app.route('/force/config', methods = ['GET'])
+def force_config():
+    """Tune the visualization. Query params (all optional):
+      scale=<m/N>             force arrow length per Newton (default 0.02)
+      threshold=<N>           hide force arrow/label below this (default 0.5)
+      max_force=<N>           force color saturates to red at this (20)
+      torque_scale=<m/(N.m)>  torque arrow length per N.m (default 0.15)
+      torque_threshold=<N.m>  hide torque arrow/label below this (default 0.05)
+      max_torque=<N.m>        torque color saturates at this (2.0)"""
+    try:
+        cfg = force_viz.set_config(
+            scale=request.args.get("scale"),
+            threshold=request.args.get("threshold"),
+            max_force=request.args.get("max_force"),
+            torque_scale=request.args.get("torque_scale"),
+            torque_threshold=request.args.get("torque_threshold"),
+            max_torque=request.args.get("max_torque"),
+        )
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": "bad params", "msg": str(e)}), 400
+    return jsonify({"status": "updated", "config": cfg}), 200
+
+@app.route('/force/identify/empty', methods = ['GET'])
+def identify_empty():
+    """Empty-gripper measurement pass for payload identification.
+    Captures the current joint config as base, visits N perturbed configs and
+    samples raw F_ext at each, then returns to base. Run with the gripper EMPTY;
+    then grasp the object and call /force/identify/loaded. Long-running; holds
+    the motion lock for the duration."""
+    if payload_identifier is None:
+        return jsonify({"error": "identifier unavailable"}), 503
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try:
+        data = payload_identifier.record_empty()
+        # Install the per-pose residuals as the visualizer's compensation table
+        # (does not enable it yet; call /force/compensate?on=1 to switch on).
+        n_cal = force_viz.set_calibration(payload_identifier.calibration()) if force_viz else 0
+        return jsonify({"status": "empty_recorded", "calibration_points": n_cal, **data}), 200
+    finally:
+        moveit_lock.release()
+
+@app.route('/force/identify/loaded', methods = ['GET'])
+def identify_loaded():
+    """Loaded measurement pass: revisit the SAME configs while holding the
+    object. Requires /force/identify/empty first (then grasp, then this)."""
+    if payload_identifier is None:
+        return jsonify({"error": "identifier unavailable"}), 503
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try:
+        return jsonify({"status": "loaded_recorded", **payload_identifier.record_loaded()}), 200
+    except ValueError as e:
+        return jsonify({"error": "sequence", "msg": str(e)}), 409
+    finally:
+        moveit_lock.release()
+
+@app.route('/force/identify/compute', methods = ['GET'])
+def identify_compute():
+    """Estimate object mass (and a rough CoM offset) from the empty + loaded
+    passes. Lock-free: pure computation over the recorded samples."""
+    if payload_identifier is None:
+        return jsonify({"error": "identifier unavailable"}), 503
+    try:
+        return jsonify({"status": "ok", **payload_identifier.compute()}), 200
+    except ValueError as e:
+        return jsonify({"error": "incomplete", "msg": str(e)}), 409
+
+@app.route('/force/identify/reset', methods = ['GET'])
+def identify_reset():
+    """Discard recorded passes so a new identification can start fresh."""
+    if payload_identifier is None:
+        return jsonify({"error": "identifier unavailable"}), 503
+    payload_identifier.reset()
+    return jsonify({"status": "reset"}), 200
+
+@app.route('/force/compensate', methods = ['GET'])
+def force_compensate():
+    """Enable/disable pose-dependent residual compensation (query: on=1/0).
+    Requires an empty calibration pass first (/force/identify/empty). When on,
+    /force and the RViz arrows use the residual of the nearest calibrated joint
+    config as the baseline, so the reported wrench is the true EXTERNAL force
+    (object weight + any contact) at the current pose, not just at a tare pose.
+    Falls back to the tare baseline at poses far from the calibrated set."""
+    if force_viz is None:
+        return jsonify({"error": "force viz unavailable"}), 503
+    on = request.args.get("on", "1") != "0"
+    if not force_viz.set_compensation(on):
+        return jsonify({
+            "error": "no_calibration",
+            "msg": "run /force/identify/empty first to record an empty-gripper calibration",
+        }), 409
+    return jsonify({"status": "compensation_on" if on else "compensation_off",
+                    "compensated": on}), 200
+
 @app.route('/health', methods = ['GET'])
 def health():
     return jsonify({
@@ -646,5 +792,24 @@ def stop():
 if __name__ == '__main__':
     host = os.environ.get('FRANKA_RESTFUL_HOST', '172.26.0.212')
     port = int(os.environ.get('FRANKA_RESTFUL_PORT', '5000'))
+    # Reliable shutdown: rospy/MoveIt spin non-daemon threads and, with the
+    # debug reloader, there's a supervisor + worker process, so a plain Ctrl-C
+    # often leaves the process hanging or the worker respawning. Kill the whole
+    # process group (supervisor + worker + all threads) so Ctrl-C / kill stops
+    # everything at once. The launching shell is in a different process group and
+    # is not affected.
+    def _hard_stop(signum=None, frame=None):
+        try:
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+        except Exception:
+            os._exit(0)
+    signal.signal(signal.SIGINT, _hard_stop)
+    signal.signal(signal.SIGTERM, _hard_stop)
+
     log.info(f"Starting Flask on {host}:{port} (override with FRANKA_RESTFUL_HOST / FRANKA_RESTFUL_PORT)")
-    app.run(host=host, port=port, debug=True)
+    try:
+        app.run(host=host, port=port, debug=DEBUG)
+    finally:
+        # If werkzeug returns from Ctrl-C but rospy/roscpp threads linger, this
+        # guarantees the process group still dies.
+        _hard_stop()

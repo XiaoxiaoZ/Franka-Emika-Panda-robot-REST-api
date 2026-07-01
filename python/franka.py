@@ -240,7 +240,11 @@ class MoveGroupPythonInterfaceTutorial(object):
         ##
         ## First initialize `moveit_commander`_ and a `rospy`_ node:
         moveit_commander.roscpp_initialize(sys.argv)
-        rospy.init_node("move_group_python_interface_tutorial", anonymous=True)
+        # disable_signals=True: don't let rospy install its own SIGINT handler,
+        # which otherwise swallows Ctrl-C and leaves the Flask server hanging.
+        # Shutdown is handled in restful.py's __main__ (hard process-group kill).
+        rospy.init_node("move_group_python_interface_tutorial", anonymous=True,
+                        disable_signals=True)
 
         ## Instantiate a `RobotCommander`_ object. Provides information such as the robot's
         ## kinematic model and the robot's current joint states
@@ -545,6 +549,62 @@ class MoveGroupPythonInterfaceTutorial(object):
                     break
         finally:
             move_group.stop()
+        return result
+
+    def clear_stop(self):
+        """Clear the user-stop flag so a new (multi-step) motion routine can run.
+        Mirrors what plan_and_execute_with_retry does at the start of a motion."""
+        self._stop_requested = False
+
+    def stop_requested(self):
+        """True if /control/stop was called and not yet cleared. Multi-step
+        routines (e.g. payload identification) poll this to bail out early."""
+        return self._stop_requested
+
+    def move_to_joint_config(self, joint_goal, vel=0.1, accel=0.05):
+        """Plan+execute a joint-space move to an explicit 7-vector joint goal.
+        Used by payload identification to revisit identical configurations in
+        the empty and loaded passes. Each joint is clamped into its safe range;
+        tries RRTConnect then the default planner. Slow by default (vel/accel
+        scaling) for quasi-static measurement. Returns a dict with executed,
+        planner_used, planning_time, joint_goal, plan_error_codes, and (if a
+        user-stop is active) stopped=True with no motion."""
+        # Honor a user-stop: do not start a new move while a stop is active.
+        if self._stop_requested:
+            return {"executed": False, "stopped": True,
+                    "joint_goal": list(joint_goal),
+                    "planner_tried": [], "plan_error_codes": []}
+        move_group = self.move_group
+        move_group.clear_pose_targets()
+        move_group.clear_path_constraints()
+        move_group.set_num_planning_attempts(10)
+        move_group.set_planning_time(5.0)
+        move_group.set_max_velocity_scaling_factor(vel)
+        move_group.set_max_acceleration_scaling_factor(accel)
+
+        goal = list(joint_goal)
+        for i in range(min(len(goal), len(PANDA_JOINT_LIMITS))):
+            lo, hi = PANDA_JOINT_LIMITS[i]
+            margin = 0.02
+            goal[i] = max(lo + margin, min(hi - margin, goal[i]))
+
+        result = {"planner_tried": [], "plan_error_codes": [], "executed": False,
+                  "joint_goal": [round(v, 5) for v in goal]}
+        try:
+            move_group.set_joint_value_target(goal)
+            for planner_id in ("RRTConnectkConfigDefault", ""):
+                move_group.set_planner_id(planner_id)
+                result["planner_tried"].append(planner_id or "(default)")
+                plan_success, plan, planning_time, error_code = move_group.plan()
+                result["plan_error_codes"].append(decode_moveit_error(error_code))
+                if plan_success:
+                    result["planner_used"] = planner_id or "(default)"
+                    result["planning_time"] = planning_time
+                    result["executed"] = bool(move_group.execute(plan, wait=True))
+                    break
+        finally:
+            move_group.stop()
+            move_group.clear_pose_targets()
         return result
 
     def go_home(self):

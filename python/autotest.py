@@ -8,6 +8,9 @@ DEFAULT_DETECT_URL   = "http://172.26.0.205:5000/detect"
 DEFAULT_MOVE_URL     = "http://172.26.0.212:5000/control/plan_joint_path"
 DEFAULT_RECOVER_URL  = "http://172.26.0.212:5000/recover"
 DEFAULT_GRIPPER_URL  = "http://172.26.0.212:5000/control/go_to_gripper_state"
+DEFAULT_GRASP_URL    = "http://172.26.0.212:5000/control/gripper_grasp"
+DEFAULT_MOVEL_URL    = "http://172.26.0.212:5000/control/plan_cartesian_path"
+DEFAULT_FORCE_URL    = "http://172.26.0.212:5000/force"
 DEFAULT_STATE_URL    = "http://172.26.0.212:5000/state"
 
 # 预设位姿
@@ -36,9 +39,17 @@ class RobotGUI:
         self.move_url_var    = tk.StringVar(value=DEFAULT_MOVE_URL)
         self.recover_url_var = tk.StringVar(value=DEFAULT_RECOVER_URL)
         self.gripper_url_var = tk.StringVar(value=DEFAULT_GRIPPER_URL)
+        self.grasp_url_var   = tk.StringVar(value=DEFAULT_GRASP_URL)
+        self.grasp_force_var = tk.StringVar(value="20")
+        self.grasp_width_var = tk.StringVar(value="0.0")
+        self.movel_url_var   = tk.StringVar(value=DEFAULT_MOVEL_URL)
+        self.step_var        = tk.StringVar(value="0.05")
+        self.force_url_var   = tk.StringVar(value=DEFAULT_FORCE_URL)
+        self.force_display_var = tk.StringVar(value="Force: -- N")
         self.state_url_var   = tk.StringVar(value=DEFAULT_STATE_URL)
 
         self._build_widgets()
+        self._poll_force()   # 启动实时力读数轮询
 
     def _build_widgets(self):
         # ----- URL 设置区域 -----
@@ -59,6 +70,15 @@ class RobotGUI:
 
         ttk.Label(url_frame, text="State URL:").grid(row=4, column=0, sticky="e")
         ttk.Entry(url_frame, textvariable=self.state_url_var, width=55).grid(row=4, column=1, sticky="w")
+
+        ttk.Label(url_frame, text="Grasp URL:").grid(row=5, column=0, sticky="e")
+        ttk.Entry(url_frame, textvariable=self.grasp_url_var, width=55).grid(row=5, column=1, sticky="w")
+
+        ttk.Label(url_frame, text="MoveL URL:").grid(row=6, column=0, sticky="e")
+        ttk.Entry(url_frame, textvariable=self.movel_url_var, width=55).grid(row=6, column=1, sticky="w")
+
+        ttk.Label(url_frame, text="Force URL:").grid(row=7, column=0, sticky="e")
+        ttk.Entry(url_frame, textvariable=self.force_url_var, width=55).grid(row=7, column=1, sticky="w")
 
         # ----- 控制按钮区域 -----
         btn_frame = ttk.LabelFrame(self.root, text="Controls")
@@ -116,21 +136,54 @@ class RobotGUI:
         # 恢复 & 退出
         ttk.Button(
             btn_frame,
-            text="Recovery",
-            command=self.recover
-        ).grid(row=6, column=0, pady=3, sticky="ew")
-
-        ttk.Button(
-            btn_frame,
-            text="Get State",
-            command=self.get_robot_state
-        ).grid(row=6, column=1, pady=3, sticky="ew")
-
-        ttk.Button(
-            btn_frame,
             text="Quit",
             command=self.root.quit
-        ).grid(row=6, column=2, pady=3, sticky="ew")
+        ).grid(row=6, column=0, columnspan=3, pady=3, sticky="ew")
+
+        # ===== Manual Control 区域: MoveL 点动 + grasp / recovery / state =====
+        manual_frame = ttk.LabelFrame(self.root, text="Manual Control (MoveL)")
+        manual_frame.grid(row=1, column=1, rowspan=3, padx=10, pady=5, sticky="nsew")
+
+        # 步距
+        step_row = ttk.Frame(manual_frame)
+        step_row.grid(row=0, column=0, pady=(4, 6), sticky="w")
+        ttk.Label(step_row, text="Step (m):").grid(row=0, column=0, sticky="e")
+        ttk.Entry(step_row, textvariable=self.step_var, width=7).grid(row=0, column=1, sticky="w", padx=(4, 0))
+
+        # 方向点动: 每个方向一个箭头, 相对当前位姿走 MoveL
+        jog = ttk.Frame(manual_frame)
+        jog.grid(row=1, column=0, pady=4)
+        ttk.Button(jog, text="+Y ↑", width=6, command=lambda: self.jog("y", +1)).grid(row=0, column=1, padx=2, pady=2)
+        ttk.Button(jog, text="−X ←", width=6, command=lambda: self.jog("x", -1)).grid(row=1, column=0, padx=2, pady=2)
+        ttk.Button(jog, text="+X →", width=6, command=lambda: self.jog("x", +1)).grid(row=1, column=2, padx=2, pady=2)
+        ttk.Button(jog, text="−Y ↓", width=6, command=lambda: self.jog("y", -1)).grid(row=2, column=1, padx=2, pady=2)
+        ttk.Button(jog, text="+Z ⇑", width=6, command=lambda: self.jog("z", +1)).grid(row=0, column=3, padx=(14, 2), pady=2)
+        ttk.Button(jog, text="−Z ⇓", width=6, command=lambda: self.jog("z", -1)).grid(row=2, column=3, padx=(14, 2), pady=2)
+
+        ttk.Separator(manual_frame, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=6)
+
+        # 力控抓取 (从 Controls 移过来)
+        grasp_row = ttk.Frame(manual_frame)
+        grasp_row.grid(row=3, column=0, pady=3, sticky="w")
+        ttk.Label(grasp_row, text="Force (N):").grid(row=0, column=0, sticky="e")
+        ttk.Entry(grasp_row, textvariable=self.grasp_force_var, width=6).grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(grasp_row, text="Width (m):").grid(row=0, column=2, sticky="e")
+        ttk.Entry(grasp_row, textvariable=self.grasp_width_var, width=6).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(grasp_row, text="Grasp (force)", command=self.grasp_force).grid(row=0, column=4)
+
+        # Recovery + State (从 Controls 移过来)
+        rs_row = ttk.Frame(manual_frame)
+        rs_row.grid(row=4, column=0, pady=3, sticky="w")
+        ttk.Button(rs_row, text="Recovery", command=self.recover).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(rs_row, text="Get State", command=self.get_robot_state).grid(row=0, column=1)
+
+        # 实时力读数 + 归零. tare 是纯软件(只记基线), 不动夹爪/机械臂, 不会掉物体.
+        force_row = ttk.Frame(manual_frame)
+        force_row.grid(row=5, column=0, pady=(8, 3), sticky="w")
+        ttk.Label(force_row, textvariable=self.force_display_var,
+                  font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Button(force_row, text="Tare (归零)", command=self.tare).grid(row=1, column=0, pady=(3, 0), padx=(0, 6))
+        ttk.Button(force_row, text="Untare", command=self.untare).grid(row=1, column=1, pady=(3, 0))
 
         # ----- 物件列表 -----
         list_frame = ttk.LabelFrame(self.root, text="Detected objects")
@@ -282,10 +335,105 @@ class RobotGUI:
             messagebox.showerror("Gripper error", str(e))
 
     def gripper_open(self):
+        # 张开夹爪是唯一会让物体"突然掉下来"的动作 -> 先确认, 防误点.
+        if not messagebox.askyesno(
+                "确认张开夹爪",
+                "确定张开夹爪吗?\n如果此刻正夹着物体, 物体会掉下来!"):
+            self.log("Open gripper cancelled.")
+            return
         self.control_gripper(0.08)
 
     def gripper_close(self):
         self.control_gripper(0.005)
+
+    def grasp_force(self):
+        """力控抓取: /control/gripper_grasp (franka_gripper/grasp action)."""
+        url = self.grasp_url_var.get().strip()
+        try:
+            force = float(self.grasp_force_var.get())
+            width = float(self.grasp_width_var.get())
+        except ValueError:
+            messagebox.showerror("Input error", "Force / Width must be numbers")
+            return
+        self.log(f"Force grasp: width={width} m, force={force} N")
+        try:
+            # eps_out 放宽,未知宽度也能正确判定成功; max_retries=0 防搬运中复位重试扰动抓握
+            self.http_get(url, params={
+                "width": width, "force": force, "speed": 0.05,
+                "eps_out": 0.08, "max_retries": 0,
+            }, timeout=20)
+        except Exception as e:
+            self.log(f"[ERROR] Grasp failed: {e}")
+            messagebox.showerror("Grasp error", str(e))
+
+    # ----------------- 手动点动 (MoveL) -----------------
+    def jog(self, axis, sign):
+        """MoveL 点动: 读当前位姿, 沿 axis 走 sign*step 米, 调 plan_cartesian_path (直线)."""
+        try:
+            step = float(self.step_var.get())
+        except ValueError:
+            messagebox.showerror("Input error", "Step must be a number")
+            return
+        try:
+            st = self.http_get(self.state_url_var.get().strip(), timeout=5).json()
+            pos = st["position"]
+            x, y, z = float(pos["x"]), float(pos["y"]), float(pos["z"])
+        except Exception as e:
+            self.log(f"[ERROR] read state for jog: {e}")
+            messagebox.showerror("State error", str(e))
+            return
+        d = sign * step
+        if axis == "x":
+            x += d
+        elif axis == "y":
+            y += d
+        elif axis == "z":
+            z += d
+        self.log(f"MoveL jog {axis}{'+' if sign > 0 else '-'} {step} m -> ({x:.3f}, {y:.3f}, {z:.3f})")
+        url = self.movel_url_var.get().strip()
+        try:
+            self.http_get(url, params={"x": x, "y": y, "z": z}, timeout=30)
+        except Exception as e:
+            self.log(f"[ERROR] MoveL failed: {e}")
+            messagebox.showerror("MoveL error", str(e))
+
+    # ----------------- 力读数 & 归零 -----------------
+    def _poll_force(self):
+        """每 0.5s 读一次 /force 更新显示. 纯读取, 出错静默(不刷屏 log)."""
+        try:
+            r = requests.get(self.force_url_var.get().strip(), timeout=1.5)
+            if r.status_code == 200:
+                d = r.json()
+                self.force_display_var.set(
+                    "Force: net %.2f N / raw %.2f N  (%s)" % (
+                        d.get("magnitude", 0.0), d.get("raw_magnitude", 0.0),
+                        d.get("baseline_source", "?")))
+            else:
+                self.force_display_var.set("Force: (unavailable %d)" % r.status_code)
+        except Exception:
+            self.force_display_var.set("Force: (server?)")
+        finally:
+            self.root.after(500, self._poll_force)
+
+    def tare(self):
+        """力/力矩归零. 纯软件: 只把当前 F_ext 记为基线, 不动夹爪/机械臂, 不会掉物体."""
+        base = self.force_url_var.get().strip()
+        try:
+            self.http_get(base + "/tare", timeout=5)
+            self.log("Tared: force/torque baseline zeroed (no gripper/arm motion).")
+        except Exception as e:
+            self.log(f"[ERROR] Tare failed: {e}")
+            messagebox.showerror("Tare error", str(e))
+
+    def untare(self):
+        """清除基线, 恢复显示原始 F_ext. 同样纯软件, 不会掉物体."""
+        base = self.force_url_var.get().strip()
+        try:
+            self.http_get(base + "/untare", timeout=5)
+            self.log("Untared: baseline cleared.")
+        except Exception as e:
+            self.log(f"[ERROR] Untare failed: {e}")
+            messagebox.showerror("Untare error", str(e))
 
     # ----------------- Recovery -----------------
     def recover(self):

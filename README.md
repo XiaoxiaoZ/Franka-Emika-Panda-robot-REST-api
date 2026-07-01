@@ -33,6 +33,99 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
   }
   ```
 
+### Force (end-effector force visualization)
+
+Visualizes the robot's estimated **external** end-effector wrench (from
+`/franka_state_controller/F_ext`, expressed in the `panda_K` frame) as two RViz
+arrows — a **force** arrow (green→red) and a **torque/moment** arrow
+(blue→magenta) — each with a magnitude label, and exposes the values over HTTP.
+Use it to see, e.g., the weight of a grasped object and, for a long/off-center
+object, the moment it exerts on the wrist.
+
+> Note: `F_ext` is an *estimate* derived from the joint-torque sensors minus the
+> robot's dynamic model, not a wrist force/torque sensor reading. Its residual
+> (a few N, a few tenths of N·m) **drifts with arm configuration and motion
+> history (joint friction/stiction)**, so the same TCP pose can read differently.
+> Treat it as good for contact/collision sensing, not precision metrology, and
+> re-tare after large pose changes.
+
+- `GET /force`
+  Current external wrench. Returns raw/net `force` and `torque` (net = after
+  tare), their magnitudes, `lever_arm` (`|net torque| / |net force|`, ≈ the
+  CoM/contact offset from the EE in meters; `null` when force ≈ 0), `frame_id`,
+  and `tared`. Lock-free — never blocks on (or blocks) robot motion. `503` until
+  the first wrench arrives.
+  ```json
+  {
+    "available": true,
+    "frame_id": "panda_K",
+    "raw_force":  { "x": 1.5, "y": 0.6, "z": -2.8 },
+    "net_force":  { "x": 1.5, "y": 0.6, "z": -2.8 },
+    "baseline_force": { "x": 0.0, "y": 0.0, "z": 0.0 },
+    "magnitude": 3.2, "raw_magnitude": 3.2,
+    "raw_torque":  { "x": -0.22, "y": -0.16, "z": -0.15 },
+    "net_torque":  { "x": -0.22, "y": -0.16, "z": -0.15 },
+    "baseline_torque": { "x": 0.0, "y": 0.0, "z": 0.0 },
+    "torque_magnitude": 0.31, "raw_torque_magnitude": 0.31,
+    "lever_arm": 0.098,
+    "tared": false
+  }
+  ```
+
+- `GET /force/tare` / `GET /force/untare`
+  Zero / restore the baselines. The estimate carries a non-zero residual with
+  nothing held, so **tare with an empty gripper**, then grasp an object to see
+  its weight (and moment) on its own. `tare` snapshots **both** force and torque
+  baselines; `untare` clears them. `503` if no wrench has arrived yet.
+
+- `GET /force/config?scale=&threshold=&max_force=&torque_scale=&torque_threshold=&max_torque=`
+  Tune the visualization (all optional). Force: `scale` = arrow length per
+  Newton (default 0.02), `threshold` = hide below this magnitude (default 0.5),
+  `max_force` = color saturates to red at this (default 20). Torque:
+  `torque_scale` = arrow length per N·m (default 0.15), `torque_threshold`
+  (default 0.05), `max_torque` = color saturates to magenta at this (default 2).
+  Scales and `max_*` must be `> 0`, thresholds `>= 0`; bad or non-finite values
+  return `400`.
+
+**Viewing it in RViz:** add a **MarkerArray** display on topic `/franka_ee_force`
+(Displays → Add → "By topic" → `/franka_ee_force`). Two arrows sit at the
+end-effector: the **force** arrow (green→red, label in N) points along the
+force; the **torque** arrow (blue→magenta, label in N·m) points along the moment
+axis (right-hand rule). Each scales with magnitude and hides below its
+threshold. Any Fixed Frame works (`panda_K` is in the TF tree).
+
+### Payload identification & residual compensation
+
+Estimate a grasped object's mass/CoM and compensate the pose-dependent `F_ext`
+residual. `F_ext` is *estimated* (no wrist FT sensor), ~3–5 N floor that drifts
+with arm configuration.
+
+- `GET /force/identify/empty` → `GET /force/identify/loaded` → `GET /force/identify/compute`
+  Multi-pose payload identification. `empty` (gripper empty) visits 5 wrist-perturbed
+  configs and records the per-pose residual (also installs it as a compensation
+  table); then grasp the object and call `loaded` (same configs); `compute` returns
+  `mass_kg`, `com_offset_K_m`, per-pose `dF`. Motion routines honor `/control/stop`.
+- `GET /force/compensate?on=1/0`
+  Enable/disable pose-dependent residual compensation (needs an `identify/empty`
+  first). When on, `/force` subtracts the nearest calibrated config's residual so
+  `net_force` is the true external/added force — accurate only near the calibrated
+  poses. `409` if no calibration.
+
+> `F_ext` **sign**: a hanging object's `raw_force` points along −`panda_K` z
+> (opposite gravity-in-EE). Direction checks should use `abs(dot(u_load, gravity))`.
+
+### Human-robot handover demo — `python/handover_demo.py`
+
+External REST client (needs only `requests` + `numpy`; no ROS). Passes an object
+between robot and human, sensing the human via `/force`. **Safe weight-transfer
+release**: the gripper opens only when the object's weight is genuinely taken by a
+human (directional, near-full transfer, progressive rise, torque cross-check,
+sustained) — never on force magnitude, stale/frozen data, or any error; any doubt
+→ **keep holding**. Run: `python3 python/handover_demo.py --start give|take
+[--no-grasp] [--home] [--grasp-force N]`. Use `--no-grasp` after a manual
+pick+lift (do **not** re-grasp an already-held object — it drops it). Stop with
+Ctrl-C (never actuates the gripper on shutdown). Keep the hardware e-stop in reach.
+
 ### Control
 
 - `GET /control/plan_cartesian_path?x=<float>&y=<float>&z=<float>`
@@ -104,6 +197,7 @@ Server bind host and port are configurable via environment variables (defaults s
 |---|---|---|
 | `FRANKA_RESTFUL_HOST` | `172.26.0.212` | Use `0.0.0.0` to bind all interfaces, `127.0.0.1` to lock to localhost |
 | `FRANKA_RESTFUL_PORT` | `5000` | |
+| `FRANKA_RESTFUL_DEBUG` | `1` | `0` disables Flask debug + the auto-reloader. The reloader re-imports the module in a child process; singletons (e.g. the force publisher) are guarded to build only in the serving process so RViz sees a single `/franka_ee_force` publisher. |
 
 Example:
 ```bash
