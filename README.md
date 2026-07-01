@@ -4,7 +4,10 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 
 ## Features
 
-- **Robot Control** — gripper width, Cartesian paths, joint-space paths, emergency stop, error recovery
+- **Robot Control** — gripper width, force-based grasp, Cartesian paths, joint-space paths, emergency stop, error recovery
+- **EE force/torque sensing** — real-time `F_ext` force + torque, RViz arrows, tare, and pose-dependent residual compensation
+- **Payload identification** — multi-pose estimate of a grasped object's mass and CoM
+- **Human-robot handover demo** — `handover_demo.py`, a fail-safe force-based hand-off (releases only on a genuine weight transfer)
 - **Planning-scene helpers** — add/remove/attach/detach a box for collision avoidance *(basic; see Current State below)*
 - **Health probe** — quick `/health` check to diagnose a stuck server without restarting
 
