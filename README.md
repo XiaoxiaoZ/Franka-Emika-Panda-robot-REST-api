@@ -9,10 +9,16 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 - **Payload identification** — multi-pose estimate of a grasped object's mass and CoM
 - **Planning-scene helpers** — add/remove/attach/detach a box for collision avoidance *(basic; see Current State below)*
 - **Health probe** — quick `/health` check to diagnose a stuck server without restarting
+- **Self-documenting** — `GET /help` returns a machine-readable guide to every endpoint (params, conventions, quickstart)
 
 ## Endpoints
 
 ### State
+
+- `GET /help`
+  Full API usage guide as JSON: every endpoint with methods and description
+  (auto-generated from the code), plus units/locking/outcome conventions and a
+  quickstart. Ideal entry point for programmatic clients and LLM agents.
 
 - `GET /state`
   Get current pose and gripper state. `gripper`: 1 = open, 0 = closed.

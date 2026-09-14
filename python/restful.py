@@ -84,8 +84,71 @@ def home():
     if(request.method == 'GET'):
 
         data = "Hello, this is Franka Emika Panda"
-        return jsonify({'data': data})
-    
+        return jsonify({'data': data, 'help': 'GET /help for a full API usage guide'})
+
+
+# Short usage notes for routes whose view function has no docstring of its own
+# (mostly thin lock wrappers). Routes WITH a docstring are self-documenting via
+# /help introspection -- prefer writing a docstring over adding entries here.
+_HELP_NOTES = {
+    "/": "API banner. GET /help for this guide.",
+    "/state": "Current EE pose (meters, base frame) + orientation quaternion + gripper (1=open, 0=closed).",
+    "/health": "Probe gripper action servers, motion-lock state, and last ROS error. Use when the API feels stuck.",
+    "/recover": "Trigger Franka automatic error recovery (clears reflex errors). 504 if not done within 15 s.",
+    "/control/stop": "Stop any ongoing motion and suppress its auto-recovery retry (in-flight request returns outcome=stopped).",
+    "/control/home": "Joint-space move to the canonical safe pose. WARNING: moves the arm.",
+    "/control/go_to_gripper_state": "MoveIt gripper to width=<m> (max 0.032 per finger). No force feedback.",
+    "/control/gripper_open": "MoveIt gripper open shortcut (0.1 m). No force feedback.",
+    "/control/gripper_close": "MoveIt gripper close shortcut (0.01 m). No force feedback.",
+    "/control/gripper_open_force": "Force-based open via franka_gripper/move. Params: width=0.08, speed=0.1, timeout=10, auto_recover=1, max_retries=1.",
+    "/control/gripper_grasp": "Force-based grasp via franka_gripper/grasp; closes until contact then applies force. Params: width=0.0, speed=0.05, force=20 (N), eps_in=0.005, eps_out=0.005 (widen to 0.08 for unknown widths), timeout=10, auto_recover=1, max_retries=1 (use max_retries=0 while transporting a held object).",
+    "/control/plan_cartesian_path": "Straight-line (MoveL) move to ABSOLUTE x,y,z in meters. Params: auto_recover=1, max_retries=1, preserve_orientation=1 (0 lets the wrist reorient). WARNING: moves the arm.",
+    "/control/plan_joint_path": "Joint-space plan+execute to x,y,z. Same params as plan_cartesian_path plus planner_id=LIN|RRTConnectkConfigDefault. WARNING: moves the arm.",
+    "/simulation/add_box": "Add the fixed demo box to the planning scene.",
+    "/simulation/remove_box": "Remove the demo box from the planning scene.",
+    "/simulation/attach_box": "Attach the demo box to the gripper (collision-checked as part of the hand).",
+    "/simulation/detach_box": "Detach the demo box from the gripper.",
+}
+
+
+@app.route('/help', methods=['GET'])
+def api_help():
+    """Machine-readable usage guide for this API: every endpoint with its
+    methods and description (auto-generated from route docstrings), plus
+    conventions (units, locking, outcomes) and a quickstart."""
+    import inspect
+    endpoints = []
+    for rule in app.url_map.iter_rules():
+        if rule.endpoint == 'static':
+            continue
+        view = app.view_functions.get(rule.endpoint)
+        doc = inspect.getdoc(view) if view else None
+        endpoints.append({
+            "path": rule.rule,
+            "methods": sorted(m for m in rule.methods if m in ("GET", "POST")),
+            "description": doc or _HELP_NOTES.get(rule.rule, ""),
+        })
+    endpoints.sort(key=lambda e: e["path"])
+    return jsonify({
+        "name": "Franka Emika Panda REST API",
+        "quickstart": [
+            "GET /state to read the robot pose and gripper state.",
+            "GET /force for the live end-effector force/torque estimate.",
+            "GET /control/plan_cartesian_path?x=&y=&z= to move (meters, absolute; MOVES THE ARM).",
+            "GET /control/gripper_grasp?force=20 to grasp; /control/gripper_open_force to open.",
+            "GET /control/stop to stop motion; GET /recover to clear reflex errors.",
+        ],
+        "conventions": {
+            "units": "meters, Newtons, N*m, radians; positions are absolute in the robot base frame",
+            "concurrency": "motion/gripper endpoints share one non-blocking lock -> 409 'Robot is busy' instead of queuing; /state /force /health /control/stop are lock-free",
+            "outcomes": "motion endpoints return outcome: success | plan_failed | execute_failed | stopped | stopped_external_force | stopped_user_button | recovery_failed (+ attempts, recovery_* fields)",
+            "safety": "pushing the robot triggers a reflex -> outcome=stopped_external_force (no auto-retry); the hardware user-stop button always wins and software cannot clear it",
+        },
+        "endpoints": endpoints,
+        "readme": "https://github.com/XiaoxiaoZ/Franka-Emika-Panda-robot-REST-api",
+    }), 200
+
+
 @app.route('/state', methods = ['GET'])
 def get_state():
     pose = robot.move_group.get_current_pose()
@@ -809,7 +872,17 @@ if __name__ == '__main__':
     log.info(f"Starting Flask on {host}:{port} (override with FRANKA_RESTFUL_HOST / FRANKA_RESTFUL_PORT)")
     try:
         app.run(host=host, port=port, debug=DEBUG)
-    finally:
-        # If werkzeug returns from Ctrl-C but rospy/roscpp threads linger, this
+    except SystemExit as e:
+        # The debug reloader restarts the worker by exiting with code 3 -- let
+        # that propagate so the supervisor respawns it. Killing the process
+        # group here (the old behavior) murdered the whole server on every
+        # code edit. Any other exit code is a real shutdown.
+        if getattr(e, "code", None) == 3:
+            raise
+        _hard_stop()
+    except BaseException:
+        _hard_stop()
+    else:
+        # If werkzeug returns normally but rospy/roscpp threads linger, this
         # guarantees the process group still dies.
         _hard_stop()
