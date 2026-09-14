@@ -92,7 +92,7 @@ def home():
 # /help introspection -- prefer writing a docstring over adding entries here.
 _HELP_NOTES = {
     "/": "API banner. GET /help for this guide.",
-    "/state": "Current EE pose (meters, base frame) + orientation quaternion + gripper (1=open, 0=closed).",
+    "/state": "Current EE pose (meters, base frame) + orientation quaternion + rpy_deg (same orientation as roll/pitch/yaw degrees, matching the motion endpoints' params) + gripper (1=open, 0=closed).",
     "/health": "Probe gripper action servers, motion-lock state, and last ROS error. Use when the API feels stuck.",
     "/recover": "Trigger Franka automatic error recovery (clears reflex errors). 504 if not done within 15 s.",
     "/control/stop": "Stop any ongoing motion and suppress its auto-recovery retry (in-flight request returns outcome=stopped).",
