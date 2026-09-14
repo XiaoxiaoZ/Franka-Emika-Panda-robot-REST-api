@@ -1070,13 +1070,13 @@ class MoveGroupPythonInterfaceTutorial(object):
         # box_pose.pose.position.y = 0.43  # 
         # box_pose.pose.position.z = 0.315  # 
         # scene.add_box(box_name, box_pose, size=(0.1, 0.02, 0.02))
-        box_name = "kiting box"
-        box_pose1 = geometry_msgs.msg.PoseStamped()
-        box_pose1.header.frame_id = move_group.get_planning_frame()
-        box_pose1.pose.position.x = 0.488  # 
-        box_pose1.pose.position.y = 0.2878  # 
-        box_pose1.pose.position.z = 0.07  # 
-        scene.add_box(box_name, box_pose1, size=(0.30, 0.20, 0.17))
+        # box_name = "kiting box"
+        # box_pose1 = geometry_msgs.msg.PoseStamped()
+        # box_pose1.header.frame_id = move_group.get_planning_frame()
+        # box_pose1.pose.position.x = 0.488  #
+        # box_pose1.pose.position.y = 0.2878  #
+        # box_pose1.pose.position.z = 0.07  #
+        # scene.add_box(box_name, box_pose1, size=(0.30, 0.20, 0.17))
 
         # box_name = "wall"
         # box_pose1 = geometry_msgs.msg.PoseStamped()
