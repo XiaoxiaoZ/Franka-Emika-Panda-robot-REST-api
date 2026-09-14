@@ -7,7 +7,6 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 - **Robot Control** — gripper width, force-based grasp, Cartesian paths, joint-space paths, emergency stop, error recovery
 - **EE force/torque sensing** — real-time `F_ext` force + torque, RViz arrows, tare, and pose-dependent residual compensation
 - **Payload identification** — multi-pose estimate of a grasped object's mass and CoM
-- **Human-robot handover demo** — `handover_demo.py`, a fail-safe force-based hand-off (releases only on a genuine weight transfer)
 - **Planning-scene helpers** — add/remove/attach/detach a box for collision avoidance *(basic; see Current State below)*
 - **Health probe** — quick `/health` check to diagnose a stuck server without restarting
 
@@ -116,18 +115,6 @@ with arm configuration.
 
 > `F_ext` **sign**: a hanging object's `raw_force` points along −`panda_K` z
 > (opposite gravity-in-EE). Direction checks should use `abs(dot(u_load, gravity))`.
-
-### Human-robot handover demo — `python/handover_demo.py`
-
-External REST client (needs only `requests` + `numpy`; no ROS). Passes an object
-between robot and human, sensing the human via `/force`. **Safe weight-transfer
-release**: the gripper opens only when the object's weight is genuinely taken by a
-human (directional, near-full transfer, progressive rise, torque cross-check,
-sustained) — never on force magnitude, stale/frozen data, or any error; any doubt
-→ **keep holding**. Run: `python3 python/handover_demo.py --start give|take
-[--no-grasp] [--home] [--grasp-force N]`. Use `--no-grasp` after a manual
-pick+lift (do **not** re-grasp an already-held object — it drops it). Stop with
-Ctrl-C (never actuates the gripper on shutdown). Keep the hardware e-stop in reach.
 
 ### Control
 
