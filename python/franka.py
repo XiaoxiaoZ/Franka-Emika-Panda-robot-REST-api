@@ -835,10 +835,12 @@ class MoveGroupPythonInterfaceTutorial(object):
         constraints.orientation_constraints.append(oc)
         return constraints
 
-    def plan_cartesian_path(self, x, y, z=0.2, scale=1, preserve_orientation=True):
-        # If preserve_orientation is True (default), the current wrist orientation
-        # is carried through the move. If False, the orientation is reset to
-        # (1,0,0,0) -- the legacy hardcoded target.
+    def plan_cartesian_path(self, x, y, z=0.2, scale=1, preserve_orientation=True,
+                            orientation=None):
+        # orientation: optional (qx, qy, qz, qw) TCP target orientation in the
+        # base frame -- takes precedence over preserve_orientation. Otherwise:
+        # preserve_orientation=True carries the current wrist orientation
+        # through the move; False resets to (1,0,0,0), the legacy target.
         move_group = self.move_group
 
         waypoints = []
@@ -846,7 +848,10 @@ class MoveGroupPythonInterfaceTutorial(object):
         wpose.position.x = scale * x
         wpose.position.y = scale * y
         wpose.position.z = scale * z
-        if not preserve_orientation:
+        if orientation is not None:
+            (wpose.orientation.x, wpose.orientation.y,
+             wpose.orientation.z, wpose.orientation.w) = orientation
+        elif not preserve_orientation:
             wpose.orientation.x = 1.0
             wpose.orientation.y = 0.0
             wpose.orientation.z = 0.0
@@ -854,9 +859,10 @@ class MoveGroupPythonInterfaceTutorial(object):
         waypoints.append(copy.deepcopy(wpose))
 
         # Apply orientation path constraint only when preserving orientation.
-        # If the caller is intentionally changing orientation, constraining
-        # the path to the new orientation makes the start state infeasible.
-        if preserve_orientation:
+        # If the caller is intentionally changing orientation (explicit target
+        # or canonical reset), constraining the path to the new orientation
+        # makes the start state infeasible.
+        if preserve_orientation and orientation is None:
             move_group.set_path_constraints(self._eef_orientation_constraint(
                 wpose.orientation.x, wpose.orientation.y,
                 wpose.orientation.z, wpose.orientation.w,
@@ -878,10 +884,12 @@ class MoveGroupPythonInterfaceTutorial(object):
 
         ## END_SUB_TUTORIAL
 
-    def plan_joint_path(self, x, y, z=0.2, scale=1, preserve_orientation=True, planner_id="LIN"):
-        # If preserve_orientation is True (default), the current wrist orientation
-        # is carried through the move. If False, the orientation is reset to
-        # (1,0,0,0) -- the legacy hardcoded target.
+    def plan_joint_path(self, x, y, z=0.2, scale=1, preserve_orientation=True, planner_id="LIN",
+                        orientation=None):
+        # orientation: optional (qx, qy, qz, qw) TCP target orientation in the
+        # base frame -- takes precedence over preserve_orientation. Otherwise:
+        # preserve_orientation=True carries the current wrist orientation
+        # through the move; False resets to (1,0,0,0), the legacy target.
         #
         # planner_id:
         #   "LIN" (default): Pilz straight-line-in-cartesian. Good for precise
@@ -896,7 +904,10 @@ class MoveGroupPythonInterfaceTutorial(object):
         wpose.position.x = scale * x
         wpose.position.y = scale * y
         wpose.position.z = scale * z
-        if not preserve_orientation:
+        if orientation is not None:
+            (wpose.orientation.x, wpose.orientation.y,
+             wpose.orientation.z, wpose.orientation.w) = orientation
+        elif not preserve_orientation:
             wpose.orientation.x = 1.0
             wpose.orientation.y = 0.0
             wpose.orientation.z = 0.0
@@ -906,7 +917,7 @@ class MoveGroupPythonInterfaceTutorial(object):
         move_group.set_planning_time(5.0)
         # Apply orientation constraint only when preserving orientation -- see
         # note in plan_cartesian_path for the rationale.
-        if preserve_orientation:
+        if preserve_orientation and orientation is None:
             move_group.set_path_constraints(self._eef_orientation_constraint(
                 wpose.orientation.x, wpose.orientation.y,
                 wpose.orientation.z, wpose.orientation.w,

@@ -142,6 +142,7 @@ with arm configuration.
   - `auto_recover=0/1` (default 1) — on execute failure, call `/franka_control/error_recovery` and retry
   - `max_retries=N` (default 1) — retries after recovery
   - `preserve_orientation=0/1` (default 1) — keep current wrist orientation vs. reset to canonical `(1,0,0,0)`. Set to 0 when you want the wrist to re-orient.
+  - **Explicit TCP orientation target** (overrides `preserve_orientation`): either `roll=&pitch=&yaw=` (degrees, base frame, `sxyz`; gripper straight down = `180,0,0` — `/state.rpy_deg` shows the current values) or a quaternion `qx=&qy=&qz=&qw=`. Partial input returns `400`. For an in-place reorientation call `plan_joint_path` with the current x,y,z (the web UI's "Set orientation" button does exactly this).
   Response includes `outcome`, `attempts`, `recovery_triggered`, `recovery_succeeded`, `fraction`, and (on failure) `last_error` and `moveit_error`.
 
 - `GET /control/plan_joint_path?x=<float>&y=<float>&z=<float>`

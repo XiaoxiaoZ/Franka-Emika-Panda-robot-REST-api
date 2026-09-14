@@ -102,8 +102,8 @@ _HELP_NOTES = {
     "/control/gripper_close": "MoveIt gripper close shortcut (0.01 m). No force feedback.",
     "/control/gripper_open_force": "Force-based open via franka_gripper/move. Params: width=0.08, speed=0.1, timeout=10, auto_recover=1, max_retries=1.",
     "/control/gripper_grasp": "Force-based grasp via franka_gripper/grasp; closes until contact then applies force. Params: width=0.0, speed=0.05, force=20 (N), eps_in=0.005, eps_out=0.005 (widen to 0.08 for unknown widths), timeout=10, auto_recover=1, max_retries=1 (use max_retries=0 while transporting a held object).",
-    "/control/plan_cartesian_path": "Straight-line (MoveL) move to ABSOLUTE x,y,z in meters. Params: auto_recover=1, max_retries=1, preserve_orientation=1 (0 lets the wrist reorient). WARNING: moves the arm.",
-    "/control/plan_joint_path": "Joint-space plan+execute to x,y,z. Same params as plan_cartesian_path plus planner_id=LIN|RRTConnectkConfigDefault. WARNING: moves the arm.",
+    "/control/plan_cartesian_path": "Straight-line (MoveL) move to ABSOLUTE x,y,z in meters. Optional TCP orientation target: roll&pitch&yaw (degrees, base frame, sxyz; straight down = 180,0,0) or qx&qy&qz&qw quaternion -- overrides preserve_orientation. Other params: auto_recover=1, max_retries=1, preserve_orientation=1 (0 = reset to canonical down). WARNING: moves the arm.",
+    "/control/plan_joint_path": "Joint-space plan+execute to x,y,z. Same params as plan_cartesian_path (incl. roll/pitch/yaw or qx..qw orientation target) plus planner_id=LIN|RRTConnectkConfigDefault (use LIN for a minimal in-place reorientation, RRTConnect for large moves). WARNING: moves the arm.",
     "/simulation/add_box": "Add the fixed demo box to the planning scene.",
     "/simulation/remove_box": "Remove the demo box from the planning scene.",
     "/simulation/attach_box": "Attach the demo box to the gripper (collision-checked as part of the hand).",
@@ -206,8 +206,20 @@ def get_state():
             "z": pose.pose.orientation.z,
             "w": pose.pose.orientation.w
         },
-        "gripper": gripper 
+        "gripper": gripper
     }
+    # Same orientation as human-friendly Euler angles (degrees, sxyz, base
+    # frame) -- matches the roll/pitch/yaw params the motion endpoints accept.
+    try:
+        from tf.transformations import euler_from_quaternion
+        import math as _m
+        r, p, yw = euler_from_quaternion([
+            pose.pose.orientation.x, pose.pose.orientation.y,
+            pose.pose.orientation.z, pose.pose.orientation.w])
+        state_dict["rpy_deg"] = {"roll": _m.degrees(r), "pitch": _m.degrees(p),
+                                 "yaw": _m.degrees(yw)}
+    except Exception:
+        pass  # tf not available -> just omit the convenience field
     return jsonify(state_dict), 200
     
 @app.route('/simulation/remove_box', methods = ['GET'])
@@ -477,16 +489,49 @@ def gripper_grasp_impl():
     try: return gripper_close1()
     finally: moveit_lock.release()
 
+def _parse_orientation_args():
+    """Optional TCP orientation target from query params. Two formats:
+      qx,qy,qz,qw  -- quaternion in the base frame (all four required), or
+      roll,pitch,yaw -- absolute Euler angles in DEGREES, base frame, 'sxyz'
+                        (all three required; gripper straight down = 180,0,0).
+    Returns a normalized (qx,qy,qz,qw) tuple, or None if no orientation given.
+    Raises ValueError on partial/invalid input."""
+    import math as _m
+    q_parts = [request.args.get(k) for k in ("qx", "qy", "qz", "qw")]
+    rpy_parts = [request.args.get(k) for k in ("roll", "pitch", "yaw")]
+    if any(v is not None for v in q_parts):
+        if any(v is None for v in q_parts):
+            raise ValueError("quaternion needs all of qx,qy,qz,qw")
+        q = [float(v) for v in q_parts]
+    elif any(v is not None for v in rpy_parts):
+        if any(v is None for v in rpy_parts):
+            raise ValueError("euler orientation needs all of roll,pitch,yaw (degrees)")
+        from tf.transformations import quaternion_from_euler
+        r, p, yw = (_m.radians(float(v)) for v in rpy_parts)
+        q = list(quaternion_from_euler(r, p, yw))  # sxyz -> (x, y, z, w)
+    else:
+        return None
+    if not all(_m.isfinite(v) for v in q):
+        raise ValueError("orientation must be finite")
+    n = _m.sqrt(sum(v * v for v in q))
+    if n < 1e-6:
+        raise ValueError("orientation quaternion has ~zero norm")
+    return tuple(v / n for v in q)
+
+
 def _parse_motion_args():
     """Common parse for motion endpoints.
-    Returns (x, y, z, auto_recover, max_retries, preserve_orientation) or raises."""
+    Returns (x, y, z, auto_recover, max_retries, preserve_orientation,
+    orientation) or raises. orientation is a normalized quaternion tuple or
+    None; when given it takes precedence over preserve_orientation."""
     x = float(request.args.get("x"))
     y = float(request.args.get("y"))
     z = float(request.args.get("z"))
     auto_recover = request.args.get("auto_recover", "1") != "0"
     max_retries = int(request.args.get("max_retries", "1"))
     preserve_orientation = request.args.get("preserve_orientation", "1") != "0"
-    return x, y, z, auto_recover, max_retries, preserve_orientation
+    orientation = _parse_orientation_args()
+    return x, y, z, auto_recover, max_retries, preserve_orientation, orientation
 
 
 def _preflight_joint_limit_check():
@@ -558,13 +603,14 @@ def _format_motion_response(outcome, extra=None):
 _last_motion = None
 
 
-def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation):
+def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation, orientation=None):
     ok, rejection = _preflight_joint_limit_check()
     if not ok:
         return rejection
 
     def plan_fn():
-        plan, fraction = robot.plan_cartesian_path(x, y, z, preserve_orientation=preserve_orientation)
+        plan, fraction = robot.plan_cartesian_path(
+            x, y, z, preserve_orientation=preserve_orientation, orientation=orientation)
         return plan, fraction >= 1.0, {"fraction": fraction}
 
     # Baseline so the classifier only considers errors that appear AFTER this
@@ -589,18 +635,20 @@ def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation):
 
 def plan_cartesian_path():
     try:
-        x, y, z, auto_recover, max_retries, preserve_orientation = _parse_motion_args()
-    except (TypeError, ValueError):
-        return jsonify({"error": "Error xy args"}), 400
+        x, y, z, auto_recover, max_retries, preserve_orientation, orientation = _parse_motion_args()
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": "bad motion args", "msg": str(e)}), 400
 
     global _last_motion
     _last_motion = {
         'kind': 'cartesian', 'x': x, 'y': y, 'z': z,
         'auto_recover': auto_recover, 'max_retries': max_retries,
         'preserve_orientation': preserve_orientation,
+        'orientation': orientation,
     }
 
-    return _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation)
+    return _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation,
+                         orientation=orientation)
 
 
 @app.route('/control/plan_cartesian_path', methods = ['GET'])
@@ -611,7 +659,8 @@ def plan_cartesian_path_impl():
     finally: moveit_lock.release()
 
 
-def _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_id="LIN"):
+def _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_id="LIN",
+              orientation=None):
     ok, rejection = _preflight_joint_limit_check()
     if not ok:
         return rejection
@@ -619,6 +668,7 @@ def _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_
     def plan_fn():
         (plan_success, plan, planning_time, error_code) = robot.plan_joint_path(
             x, y, z, preserve_orientation=preserve_orientation, planner_id=planner_id,
+            orientation=orientation,
         )
         return plan, bool(plan_success), {"planning_time": planning_time, "error_code": error_code, "planner_id": planner_id}
 
@@ -641,20 +691,22 @@ def _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_
 
 def plan_joint_path():
     try:
-        x, y, z, auto_recover, max_retries, preserve_orientation = _parse_motion_args()
+        x, y, z, auto_recover, max_retries, preserve_orientation, orientation = _parse_motion_args()
         planner_id = request.args.get("planner_id", "LIN")
-    except (TypeError, ValueError):
-        return jsonify({"error": "Error xy args"}), 400
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": "bad motion args", "msg": str(e)}), 400
 
     global _last_motion
     _last_motion = {
         'kind': 'joint', 'x': x, 'y': y, 'z': z,
         'auto_recover': auto_recover, 'max_retries': max_retries,
         'preserve_orientation': preserve_orientation,
+        'orientation': orientation,
         'planner_id': planner_id,
     }
 
-    return _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_id=planner_id)
+    return _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation,
+                     planner_id=planner_id, orientation=orientation)
 
 
 @app.route('/control/plan_joint_path', methods = ['GET'])
@@ -688,10 +740,12 @@ def resume_impl():
         lm = _last_motion
         if lm['kind'] == 'cartesian':
             return _do_cartesian(lm['x'], lm['y'], lm['z'],
-                                 lm['auto_recover'], lm['max_retries'], lm['preserve_orientation'])
+                                 lm['auto_recover'], lm['max_retries'], lm['preserve_orientation'],
+                                 orientation=lm.get('orientation'))
         if lm['kind'] == 'joint':
             return _do_joint(lm['x'], lm['y'], lm['z'],
                              lm['auto_recover'], lm['max_retries'], lm['preserve_orientation'],
+                             orientation=lm.get('orientation'),
                              planner_id=lm.get('planner_id', 'LIN'))
         return jsonify({"error": f"unknown cached motion kind: {lm.get('kind')}"}), 500
     finally:
