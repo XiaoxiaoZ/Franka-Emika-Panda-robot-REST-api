@@ -149,6 +149,42 @@ def api_help():
     }), 200
 
 
+_WEBUI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui.html")
+
+
+@app.route('/ui', methods=['GET'])
+def web_ui():
+    """Browser control panel (single self-contained page, no install needed):
+    open http://<this-host>:5000/ui from any device on the network. Presets,
+    detect+pick, gripper (incl. force grasp), MoveL jog, force tare, STOP."""
+    try:
+        with open(_WEBUI_PATH, "r", encoding="utf-8") as f:
+            html = f.read()
+    except OSError:
+        return jsonify({"error": "webui.html not found next to restful.py"}), 404
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+# Fixed target only (no ?url= override -- that would make this an open proxy /
+# SSRF vector). Override at server start via FRANKA_DETECT_URL if needed.
+_DETECT_URL = os.environ.get("FRANKA_DETECT_URL", "http://172.26.0.205:5000/detect")
+
+
+@app.route('/detect_proxy', methods=['GET'])
+def detect_proxy():
+    """Server-side proxy to the vision /detect service so the web UI can call
+    it without browser CORS issues. Target is fixed at server start (env
+    FRANKA_DETECT_URL, default the lab vision host); returns its JSON verbatim."""
+    try:
+        import requests as _rq
+        r = _rq.get(_DETECT_URL, timeout=15)
+        return r.text, r.status_code, {
+            "Content-Type": r.headers.get("Content-Type", "application/json")}
+    except Exception:
+        return jsonify({"error": "detect_unreachable",
+                        "msg": f"vision service at {_DETECT_URL} not reachable"}), 502
+
+
 @app.route('/state', methods = ['GET'])
 def get_state():
     pose = robot.move_group.get_current_pose()

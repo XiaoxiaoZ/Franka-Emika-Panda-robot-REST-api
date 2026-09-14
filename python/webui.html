@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Franka Screw Picker</title>
+<style>
+  :root { --bg:#f4f6f8; --card:#fff; --ink:#1c2733; --mut:#6b7a89; --line:#dde4ea;
+          --blue:#2264d1; --green:#1d8a4e; --red:#c62828; --amber:#b26a00; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px;
+           background:var(--card); border-bottom:1px solid var(--line);
+           position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  #conn { width:10px; height:10px; border-radius:50%; background:#bbb; }
+  #conn.ok { background:var(--green); } #conn.bad { background:var(--red); }
+  #statusbar { display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:var(--mut); }
+  #statusbar b { color:var(--ink); font-variant-numeric:tabular-nums; }
+  #stopbtn { margin-left:auto; background:var(--red); color:#fff; border:none;
+             border-radius:8px; padding:10px 18px; font-size:15px; font-weight:700;
+             cursor:pointer; }
+  #stopbtn:active { background:#8e1c1c; }
+  main { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+         gap:12px; padding:12px 16px; max-width:1200px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:12px 14px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
+             color:var(--mut); margin:0 0 10px; }
+  button { background:var(--blue); color:#fff; border:none; border-radius:7px;
+           padding:9px 12px; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.warn { background:var(--amber); } button.good { background:var(--green); }
+  button.ghost { background:#eef2f6; color:var(--ink); border:1px solid var(--line); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
+  .row:last-child { margin-bottom:0; }
+  input { width:80px; padding:8px; border:1px solid var(--line); border-radius:7px;
+          font-size:14px; }
+  label { font-size:13px; color:var(--mut); }
+  #jog { display:grid; grid-template-columns:repeat(4,64px); grid-auto-rows:52px;
+         gap:6px; justify-content:start; }
+  #jog button { font-size:15px; padding:0; }
+  #objects { list-style:none; margin:0; padding:0; max-height:180px; overflow:auto;
+             border:1px solid var(--line); border-radius:7px; }
+  #objects li { padding:7px 10px; border-bottom:1px solid var(--line); cursor:pointer;
+                font-size:14px; }
+  #objects li:last-child { border-bottom:none; }
+  #objects li.sel { background:#e3ecfa; }
+  #log { grid-column:1 / -1; }
+  #logbox { font:12px/1.5 ui-monospace,Menlo,Consolas,monospace; background:#10161d;
+            color:#cfe3d8; border-radius:8px; padding:10px; height:180px;
+            overflow:auto; white-space:pre-wrap; word-break:break-all; }
+  .err { color:#ff9d9d; } .okl { color:#8fd9a8; }
+</style>
+</head>
+<body>
+<header>
+  <span id="conn"></span>
+  <h1>Franka Screw Picker</h1>
+  <div id="statusbar">
+    <span>x <b id="sx">–</b></span><span>y <b id="sy">–</b></span><span>z <b id="sz">–</b></span>
+    <span>gripper <b id="sg">–</b></span>
+    <span>|F| net <b id="sfn">–</b> N</span><span>raw <b id="sfr">–</b> N</span>
+  </div>
+  <button id="stopbtn" onclick="doStop()">STOP</button>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Presets</h2>
+    <div class="row">
+      <button onclick="goPose(0.6,-0.27,0.4,'CAMERA')">Camera pose</button>
+      <button onclick="goPose(0.488,0.2878,0.2,'KITTING')">Kitting pose</button>
+      <button onclick="goPose(0.488,0.2878,0.3,'ABOVE-KITTING')">Above kitting</button>
+    </div>
+    <div class="row">
+      <button class="warn" onclick="goHome()">Home arm</button>
+      <button class="ghost" onclick="doRecover()">Recovery</button>
+      <button class="ghost" onclick="refreshState(true)">Get state</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Detect &amp; pick</h2>
+    <div class="row">
+      <button onclick="detect()">Detect objects</button>
+      <button class="ghost" onclick="moveSelected()">Move to selected</button>
+      <button class="ghost" title="moves to the object after the last one visited"
+              onclick="moveNext()">Move to next</button>
+    </div>
+    <ul id="objects"><li style="color:var(--mut)">no objects — press Detect</li></ul>
+  </section>
+
+  <section class="card">
+    <h2>Gripper</h2>
+    <div class="row">
+      <button onclick="gripperOpen()">Open (0.08)</button>
+      <button class="ghost" onclick="gripperClose()">Close (0.005)</button>
+    </div>
+    <div class="row">
+      <label>Force (N)</label><input id="gforce" type="number" value="20" step="1" min="1" max="70">
+      <label>Width (m)</label><input id="gwidth" type="number" value="0.0" step="0.005" min="0" max="0.08">
+      <button class="good" onclick="forceGrasp()">Grasp (force)</button>
+    </div>
+    <div class="row">
+      <button class="ghost" onclick="callApi('/force/tare','tare')">Tare force</button>
+      <button class="ghost" onclick="callApi('/force/untare','untare')">Untare</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Manual (MoveL)</h2>
+    <div class="row"><label>Step (m)</label>
+      <input id="step" type="number" value="0.02" step="0.01" min="0.001" max="0.2"></div>
+    <div id="jog">
+      <span></span><button onclick="jog('y',1)">+Y ↑</button><span></span><button onclick="jog('z',1)">+Z ⇑</button>
+      <button onclick="jog('x',-1)">−X ←</button><span></span><button onclick="jog('x',1)">+X →</button><span></span>
+      <span></span><button onclick="jog('y',-1)">−Y ↓</button><span></span><button onclick="jog('z',-1)">−Z ⇓</button>
+    </div>
+  </section>
+
+  <section class="card" id="log">
+    <h2>Log</h2>
+    <div id="logbox"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+// Safety limits enforced in JS (HTML min/max are advisory only for typed input)
+const STEP_MIN = 0.001, STEP_MAX = 0.2;      // m
+const FORCE_MIN = 1, FORCE_MAX = 70;         // N
+const WIDTH_MIN = 0, WIDTH_MAX = 0.08;       // m
+let objects = [], selIdx = -1, nextIdx = 0, motionBusy = false;
+
+function log(msg, cls) {
+  const t = new Date().toTimeString().slice(0, 8);
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  div.textContent = `[${t}] ${msg}`;
+  const box = $('logbox');
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function api(path, timeoutMs = 60000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(path, { signal: ctl.signal });
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = { raw: text }; }
+    return { status: r.status, body };
+  } finally { clearTimeout(timer); }
+}
+
+async function callApi(path, label, timeoutMs) {
+  log(`GET ${path}`);
+  try {
+    const { status, body } = await api(path, timeoutMs);
+    const brief = JSON.stringify(body);
+    log(`${label}: HTTP ${status} ${brief.length > 220 ? brief.slice(0, 220) + '…' : brief}`,
+        status >= 400 ? 'err' : 'okl');
+    return { status, body };
+  } catch (e) {
+    log(`${label}: ${e.name === 'AbortError' ? 'timeout' : e}`, 'err');
+    return { status: 0, body: null };
+  }
+}
+
+// ---- motion / lock-taking calls: serialized on the client too ----
+// Everything that takes the server's motion lock (arm moves AND gripper
+// actions) goes through motion(); STOP / recover / tare stay ungated.
+async function motion(path, label, timeoutMs = 90000) {
+  if (motionBusy) { log('busy: a robot request is already in flight', 'err'); return null; }
+  motionBusy = true;
+  try { return await callApi(path, label, timeoutMs); }
+  finally { motionBusy = false; }
+}
+const goPose = (x, y, z, name) =>
+  motion(`/control/plan_joint_path?x=${x}&y=${y}&z=${z}`, `go ${name}`);
+
+async function jog(axis, sign) {
+  if (motionBusy) { log('busy: a robot request is already in flight', 'err'); return; }
+  const step = parseFloat($('step').value);
+  if (!(step >= STEP_MIN && step <= STEP_MAX)) {
+    log(`step must be ${STEP_MIN}–${STEP_MAX} m`, 'err'); return;
+  }
+  motionBusy = true;   // hold the client lock across read-state + move so the
+  try {                // pose snapshot can't go stale under our own actions
+    const st = await callApi('/state', 'read state', 8000);
+    if (!st.body || st.status !== 200) return;
+    const p = st.body.position;
+    const t = { x: p.x, y: p.y, z: p.z };
+    t[axis] += sign * step;
+    await callApi(
+      `/control/plan_cartesian_path?x=${t.x.toFixed(4)}&y=${t.y.toFixed(4)}&z=${t.z.toFixed(4)}`,
+      `jog ${sign > 0 ? '+' : '−'}${axis} ${step}`, 90000);
+  } finally { motionBusy = false; }
+}
+
+function goHome() {
+  if (confirm('Home the arm? It will MOVE to the canonical pose — clear the workspace.'))
+    motion('/control/home', 'home');
+}
+const doStop = () => callApi('/control/stop', 'STOP', 8000);      // never gated
+const doRecover = () => callApi('/recover', 'recover', 25000);    // never gated
+
+// ---- gripper (takes the server lock -> goes through motion()) ----
+function gripperOpen() {
+  if (confirm('Open the gripper? If it is holding an object, the object WILL DROP.'))
+    motion('/control/go_to_gripper_state?width=0.08', 'open', 30000);
+}
+const gripperClose = () => motion('/control/go_to_gripper_state?width=0.005', 'close', 30000);
+function forceGrasp() {
+  const f = parseFloat($('gforce').value), w = parseFloat($('gwidth').value);
+  if (!(f >= FORCE_MIN && f <= FORCE_MAX)) { log(`force must be ${FORCE_MIN}–${FORCE_MAX} N`, 'err'); return; }
+  if (!(w >= WIDTH_MIN && w <= WIDTH_MAX)) { log(`width must be ${WIDTH_MIN}–${WIDTH_MAX} m`, 'err'); return; }
+  motion(`/control/gripper_grasp?width=${w}&force=${f}&speed=0.05&eps_out=0.08&max_retries=0`,
+         'force grasp', 30000);
+}
+
+// ---- detect & pick ----
+function renderObjects() {
+  const ul = $('objects');
+  ul.innerHTML = '';
+  if (!objects.length) {
+    ul.innerHTML = '<li style="color:var(--mut)">no objects — press Detect</li>';
+    return;
+  }
+  objects.forEach((o, i) => {
+    const li = document.createElement('li');
+    li.textContent = `${i + 1}. ${o.name || 'object'}  x=${(+o.x).toFixed(3)}, y=${(+o.y).toFixed(3)}`;
+    if (i === selIdx) li.className = 'sel';
+    li.onclick = () => { selIdx = i; renderObjects(); };
+    ul.appendChild(li);
+  });
+}
+async function detect() {
+  const { status, body } = await callApi('/detect_proxy', 'detect', 25000);
+  if (status === 200 && Array.isArray(body)) {
+    objects = body; selIdx = -1; nextIdx = 0;
+    log(`detected ${objects.length} objects`, 'okl');
+  } else if (status === 200) {
+    log('detect: response is not a list', 'err');
+  }
+  renderObjects();
+}
+// Move to object i; only advance the cycle if the request was actually
+// dispatched and accepted (fixes: a busy-gated/409 click must not skip objects)
+async function moveToObject(i, label) {
+  const o = objects[i];
+  const r = await motion(`/control/plan_joint_path?x=${o.x}&y=${o.y}&z=0.1`, label);
+  return !!(r && r.status > 0 && r.status !== 409);
+}
+async function moveSelected() {
+  if (selIdx < 0) { log('no object selected', 'err'); return; }
+  if (motionBusy) { log('busy: a robot request is already in flight', 'err'); return; }
+  const i = selIdx;
+  if (await moveToObject(i, `move to #${i + 1}`)) nextIdx = (i + 1) % objects.length;
+}
+async function moveNext() {
+  if (!objects.length) { log('no objects — detect first', 'err'); return; }
+  if (motionBusy) { log('busy: a robot request is already in flight', 'err'); return; }
+  const i = nextIdx;
+  selIdx = i;                    // highlight the object we are ACTUALLY moving to
+  renderObjects();
+  if (await moveToObject(i, `move to #${i + 1}`)) nextIdx = (i + 1) % objects.length;
+}
+
+// ---- live status (state and force handled independently; no overlap) ----
+let pollBusy = false;
+async function refreshState(logIt) {
+  if (pollBusy && !logIt) return;   // skip the tick if the last poll is slow
+  pollBusy = true;
+  try {
+    const [st, fo] = await Promise.allSettled([api('/state', 4000), api('/force', 4000)]);
+    if (st.status === 'fulfilled' && st.value.status === 200) {
+      const p = st.value.body.position;
+      $('sx').textContent = p.x.toFixed(3);
+      $('sy').textContent = p.y.toFixed(3);
+      $('sz').textContent = p.z.toFixed(3);
+      $('sg').textContent = st.value.body.gripper === 1 ? 'open' : 'closed';
+      $('conn').className = 'ok';
+      if (logIt) log(`state: x=${p.x.toFixed(3)} y=${p.y.toFixed(3)} z=${p.z.toFixed(3)} gripper=${st.value.body.gripper === 1 ? 'open' : 'closed'}`, 'okl');
+    } else {
+      $('conn').className = 'bad';
+      if (logIt) log('state: unavailable', 'err');
+    }
+    if (fo.status === 'fulfilled' && fo.value.status === 200) {
+      $('sfn').textContent = fo.value.body.magnitude.toFixed(1);
+      $('sfr').textContent = fo.value.body.raw_magnitude.toFixed(1);
+    } else {
+      $('sfn').textContent = '–';   // don't freeze stale numbers when the
+      $('sfr').textContent = '–';   // force feed is down/unavailable
+    }
+  } finally { pollBusy = false; }
+}
+setInterval(refreshState, 1000);
+refreshState();
+log('Franka web GUI ready. All commands go to this server (' + location.host + ').', 'okl');
+</script>
+</body>
+</html>

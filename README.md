@@ -10,6 +10,7 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 - **Planning-scene helpers** — add/remove/attach/detach a box for collision avoidance *(basic; see Current State below)*
 - **Health probe** — quick `/health` check to diagnose a stuck server without restarting
 - **Self-documenting** — `GET /help` returns a machine-readable guide to every endpoint (params, conventions, quickstart)
+- **Web control panel** — open `http://<host>:5000/ui` from any browser on the network (phone/tablet/PC, zero install): presets, detect &amp; pick, gripper + force grasp, MoveL jog, live pose/force, STOP
 
 ## Endpoints
 
@@ -19,6 +20,17 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
   Full API usage guide as JSON: every endpoint with methods and description
   (auto-generated from the code), plus units/locking/outcome conventions and a
   quickstart. Ideal entry point for programmatic clients and LLM agents.
+
+- `GET /ui`
+  Browser control panel (single self-contained page served from `python/webui.html`,
+  no install): preset poses, detect &amp; pick (via `/detect_proxy`), gripper open/close
+  and force grasp, MoveL jog with adjustable step, force tare, live pose/force status,
+  and a STOP button. Anyone who can reach this host can command the robot — keep it
+  on a trusted network.
+
+- `GET /detect_proxy`
+  Server-side proxy to the vision `/detect` service (avoids browser CORS). Target is
+  fixed at server start (`FRANKA_DETECT_URL`, default `http://172.26.0.205:5000/detect`).
 
 - `GET /state`
   Get current pose and gripper state. `gripper`: 1 = open, 0 = closed.
