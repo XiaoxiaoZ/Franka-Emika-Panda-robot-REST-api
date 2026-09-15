@@ -61,6 +61,9 @@ if not gripper_grasp_client.wait_for_server(rospy.Duration(10.0)):
     rospy.logerr("franka_gripper/grasp action server not available after 10s")
 rospy.loginfo("franka_gripper action servers are ready (or timed out).")
 robot.add_floor()
+# Safety walls: fence the arm into the working quadrant (people stand in the
+# other regions). See MoveGroupPythonInterfaceTutorial.add_virtual_walls.
+robot.add_virtual_walls()
 
 # End-effector force visualization: subscribes to /franka_state_controller/F_ext
 # and publishes an arrow+label MarkerArray to /franka_ee_force for RViz.

@@ -1054,6 +1054,60 @@ class MoveGroupPythonInterfaceTutorial(object):
         self.box_name = box_name
         return self.wait_for_state_update(box_is_known=True, timeout=timeout)
     
+    def add_virtual_walls(self):
+        """Two virtual walls fencing the arm into the working region
+        (x > -0.45, y > -0.45): people stand in the other quadrants, and with
+        these in the planning scene MoveIt refuses any plan that would sweep a
+        link into them. Both walls sit at -0.45 for clearance, which also keeps the
+        legacy CAMERA photo pose at y=-0.27 reachable (user decision, 2026-09-15). Walls are colored transparent red in RViz."""
+        import time as _time
+        from moveit_msgs.msg import PlanningScene, ObjectColor
+        from std_msgs.msg import ColorRGBA
+
+        scene = self.scene
+        frame = self.move_group.get_planning_frame()
+
+        def _wall(name, cx, cy, sx, sy):
+            pose = geometry_msgs.msg.PoseStamped()
+            pose.header.frame_id = frame
+            pose.pose.orientation.w = 1.0
+            pose.pose.position.x = cx
+            pose.pose.position.y = cy
+            pose.pose.position.z = 0.7          # spans z 0..1.4
+            scene.add_box(name, pose, size=(sx, sy, 1.4))
+
+        # The PSI publisher is asynchronous and silently drops messages until
+        # it is connected to move_group (bites right after a server restart),
+        # so add-and-verify with retries against the reliable scene service.
+        wanted = {"virtual_wall_y", "virtual_wall_x"}
+        for _attempt in range(6):
+            _wall("virtual_wall_y", 0.0, -0.45, 2.0, 0.02)   # blocks y < -0.45
+            _wall("virtual_wall_x", -0.45, 0.0, 0.02, 2.0)   # blocks x < -0.45
+            _time.sleep(0.5)
+            try:
+                if wanted.issubset(set(scene.get_known_object_names())):
+                    break
+            except Exception:
+                pass
+        else:
+            rospy.logerr("virtual walls NOT confirmed in the planning scene!")
+
+        # Transparent red rendering in RViz (collision behavior is unaffected
+        # by color). Publish an ObjectColor diff on /planning_scene.
+        try:
+            pub = rospy.Publisher("/planning_scene", PlanningScene, queue_size=2)
+            _time.sleep(0.5)  # let the publisher connect to move_group
+            ps = PlanningScene()
+            ps.is_diff = True
+            for name in ("virtual_wall_y", "virtual_wall_x"):
+                oc = ObjectColor()
+                oc.id = name
+                oc.color = ColorRGBA(r=1.0, g=0.25, b=0.2, a=0.35)
+                ps.object_colors.append(oc)
+            pub.publish(ps)
+        except Exception as e:
+            rospy.logwarn("virtual wall coloring failed (walls still active): %s", e)
+
     def add_floor(self, timeout=4):
         # Copy class variables to local variables to make the web tutorials more clear.
         # In practice, you should use the class variables directly unless you have a good
