@@ -40,10 +40,15 @@ depth is **aligned to color**, so pixel `(u,v)` indexes the same point in both
 images. Camera endpoints never block robot motion. Needs `pyrealsense2`
 (installed user-level; the server extends `sys.path` to find it under sudo).
 
+Default stream: **848×480 @ 15 fps** (both color and depth — matches archived
+scans / hand-eye calibration FOV; `ppx≈428`).
+
 - `GET /camera/info` — status, serial, `depth_scale_m`, color intrinsics (`fx, fy, ppx, ppy`, coeffs), frame age.
+- `GET /camera/config` — no params: current config + supported (w, h, fps) modes. With `width=&height=&fps=`: restart the stream with the new mode, validated against the device — on failure the previous config is restored (`400`).
 - `GET /camera/start` / `GET /camera/stop` — start (idempotent; image endpoints auto-start) / release the USB device.
-- `GET /camera/color?quality=85` — latest color frame as JPEG (browser-viewable).
-- `GET /camera/depth` — latest aligned depth as **16-bit PNG in millimeters** (0 = no data; lossless).
+- `GET /camera/color?format=jpg|png&quality=85` — latest color frame; `format=png` is **lossless** (archival / segmentation). Headers `X-Frame-Id` / `X-Frame-TS` identify the frameset.
+- `GET /camera/depth` — latest aligned depth as **16-bit PNG in millimeters** (0 = no data; lossless). Same `X-Frame-Id` / `X-Frame-TS` headers for consistency checks.
+- `GET /camera/frame` — color + depth from the **same frameset** in one request (no frame-apart risk): compressed `.npz` with `color_bgr`, `depth_mm`, `frame_id`, `ts`, `fx fy ppx ppy`, `depth_scale_m`. Load with `numpy.load`.
 - `GET /camera/depth/preview?max_m=4.0` — colorized depth JPEG for humans (black = no data).
 - `GET /camera/depth_at?u=&v=&win=5` — median depth (m) in a window at pixel `(u,v)` plus the deprojected 3D `point_camera_m` (camera frame: x right, y down, z forward).
 

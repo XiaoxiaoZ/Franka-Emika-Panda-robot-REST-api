@@ -186,6 +186,42 @@ def camera_info():
     return jsonify(camera.info()), 200
 
 
+@app.route('/camera/config', methods=['GET'])
+def camera_config():
+    """Get or set the camera stream configuration.
+    Without params: current config + every (width, height, fps) mode the
+    device supports for color and depth. With width=&height=&fps= (any
+    subset): restart the stream with the new COLOR mode, validated against
+    the real device -- on failure the previous config is restored and 400 is
+    returned. Depth picks a compatible mode automatically (aligned output is
+    color-sized regardless). Common D435 color modes: 1920x1080, 1280x720,
+    848x480, 640x480, 424x240 at 6/15/30 fps (60 at low res)."""
+    w = request.args.get("width")
+    h = request.args.get("height")
+    fps = request.args.get("fps")
+    if not any((w, h, fps)):
+        return jsonify({
+            "current": {"width": camera.width, "height": camera.height,
+                        "fps": camera.fps, "streaming": camera.info()["streaming"]},
+            "supported_modes": camera.supported_modes(),
+        }), 200
+    try:
+        vals = {}
+        for k, v in (("width", w), ("height", h), ("fps", fps)):
+            if v is not None:
+                vals[k] = int(v)
+                if not (0 < vals[k] <= 4096):
+                    raise ValueError(k)
+    except (TypeError, ValueError):
+        return jsonify({"error": "width/height/fps must be positive integers"}), 400
+    ok, err = camera.set_config(**vals)
+    if not ok:
+        return jsonify({"error": "config_rejected", "msg": err,
+                        "restored": {"width": camera.width, "height": camera.height,
+                                     "fps": camera.fps}}), 400
+    return jsonify({"status": "reconfigured", **camera.info()}), 200
+
+
 @app.route('/camera/start', methods=['GET'])
 def camera_start():
     """Start the D435 stream (color 640x480 + depth aligned to color).
@@ -206,11 +242,17 @@ def camera_stop():
 
 @app.route('/camera/color', methods=['GET'])
 def camera_color():
-    """Latest color frame as JPEG (auto-starts the camera). Query:
-    quality=1..100 (default 85). Viewable directly in a browser."""
+    """Latest color frame (auto-starts the camera). Query: format=jpg|png
+    (png = LOSSLESS, for archival / segmentation models; default jpg),
+    quality=1..100 for jpg (default 85). Response headers X-Frame-Id /
+    X-Frame-TS identify the frameset -- compare with /camera/depth to verify
+    the two came from the same instant. Viewable directly in a browser."""
     ok, err = camera.ensure_started()
     if not ok:
         return _camera_unavailable(err)
+    fmt = request.args.get("format", "jpg").lower()
+    if fmt not in ("jpg", "jpeg", "png"):
+        return jsonify({"error": "format must be jpg or png"}), 400
     try:
         quality = int(request.args.get("quality", "85"))
     except ValueError:
@@ -219,30 +261,71 @@ def camera_color():
     if fr is None:
         return _camera_unavailable("no frame yet")
     import cv2
-    ok2, buf = cv2.imencode(".jpg", fr["color"],
-                            [cv2.IMWRITE_JPEG_QUALITY, max(1, min(100, quality))])
+    if fmt == "png":
+        ok2, buf = cv2.imencode(".png", fr["color"])
+        mime = "image/png"
+    else:
+        ok2, buf = cv2.imencode(".jpg", fr["color"],
+                                [cv2.IMWRITE_JPEG_QUALITY, max(1, min(100, quality))])
+        mime = "image/jpeg"
     if not ok2:
-        return jsonify({"error": "jpeg encode failed"}), 500
-    return Response(buf.tobytes(), mimetype="image/jpeg")
+        return jsonify({"error": "encode failed"}), 500
+    resp = Response(buf.tobytes(), mimetype=mime)
+    resp.headers["X-Frame-Id"] = str(fr.get("id", 0))
+    resp.headers["X-Frame-TS"] = repr(fr["ts"])
+    return resp
 
 
 @app.route('/camera/depth', methods=['GET'])
 def camera_depth():
     """Latest aligned depth frame as 16-bit PNG in MILLIMETERS (0 = no data).
     Lossless; pixel (u,v) corresponds to the same (u,v) in /camera/color.
-    Convert to meters: value / 1000."""
+    Convert to meters: value / 1000. Headers X-Frame-Id / X-Frame-TS identify
+    the frameset (match against /camera/color, or use /camera/frame to get a
+    guaranteed-consistent pair in one request)."""
     ok, err = camera.ensure_started()
     if not ok:
         return _camera_unavailable(err)
-    mm = camera.depth_mm()
-    if mm is None:
+    b = camera.frame_bundle()
+    if b is None:
         return _camera_unavailable("no frame yet")
     import cv2
-    ok2, buf = cv2.imencode(".png", mm)
+    ok2, buf = cv2.imencode(".png", b["depth_mm"])
     if not ok2:
         return jsonify({"error": "png encode failed"}), 500
     resp = Response(buf.tobytes(), mimetype="image/png")
     resp.headers["X-Depth-Units"] = "millimeters"
+    resp.headers["X-Frame-Id"] = str(b["id"])
+    resp.headers["X-Frame-TS"] = repr(b["ts"])
+    return resp
+
+
+@app.route('/camera/frame', methods=['GET'])
+def camera_frame():
+    """Color + depth from the SAME frameset in one request -- no risk of the
+    two being a frame apart (matters right after the arm stops). Returns a
+    compressed .npz: color_bgr (HxWx3 u8), depth_mm (HxW u16, 0 = no data),
+    frame_id, ts, fx, fy, ppx, ppy, depth_scale_m. Load with numpy:
+    d = np.load(io.BytesIO(resp.content)); d['color_bgr'], d['depth_mm']."""
+    ok, err = camera.ensure_started()
+    if not ok:
+        return _camera_unavailable(err)
+    b = camera.frame_bundle()
+    if b is None:
+        return _camera_unavailable("no frame yet")
+    import io
+    import numpy as _np
+    bio = io.BytesIO()
+    _np.savez_compressed(
+        bio, color_bgr=b["color"], depth_mm=b["depth_mm"],
+        frame_id=_np.int64(b["id"]), ts=_np.float64(b["ts"]),
+        fx=_np.float64(b["fx"]), fy=_np.float64(b["fy"]),
+        ppx=_np.float64(b["ppx"]), ppy=_np.float64(b["ppy"]),
+        depth_scale_m=_np.float64(b["depth_scale_m"]))
+    resp = Response(bio.getvalue(), mimetype="application/octet-stream")
+    resp.headers["Content-Disposition"] = f"attachment; filename=frame_{b['id']}.npz"
+    resp.headers["X-Frame-Id"] = str(b["id"])
+    resp.headers["X-Frame-TS"] = repr(b["ts"])
     return resp
 
 

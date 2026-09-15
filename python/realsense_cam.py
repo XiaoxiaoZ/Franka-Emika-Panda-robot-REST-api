@@ -41,7 +41,7 @@ def _import_rs():
 
 
 class RealsenseCamera:
-    def __init__(self, width=640, height=480, fps=15):
+    def __init__(self, width=848, height=480, fps=15):
         self.width, self.height, self.fps = width, height, fps
         self._lock = threading.Lock()
         self._frames = None          # {"color": bgr u8, "depth": raw u16, "ts": float}
@@ -50,7 +50,9 @@ class RealsenseCamera:
         self._depth_scale = None     # meters per depth unit (D435: 0.001)
         self._intrinsics = None      # color-stream intrinsics (fx, fy, ppx, ppy, ...)
         self._serial = None
+        self._depth_res = None   # actual depth-sensor stream resolution
         self._running = False
+        self._seq = 0            # frame counter (id for consistency checks)
         self._last_error = None
 
     # ------------------------------------------------------------------ #
@@ -58,6 +60,8 @@ class RealsenseCamera:
     # ------------------------------------------------------------------ #
     def start(self):
         """Open the device and start grabbing. Idempotent.
+        The depth stream tries the color resolution first, then falls back to
+        common D435 depth modes (align upscales depth to color size anyway).
         Returns (ok, error_message)."""
         with self._lock:
             if self._running:
@@ -66,12 +70,24 @@ class RealsenseCamera:
         try:
             rs = _import_rs()
             pipeline = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_stream(rs.stream.color, self.width, self.height,
-                              rs.format.bgr8, self.fps)
-            cfg.enable_stream(rs.stream.depth, self.width, self.height,
-                              rs.format.z16, self.fps)
-            profile = pipeline.start(cfg)
+            depth_candidates = [(self.width, self.height),
+                                (848, 480), (640, 480), (1280, 720)]
+            profile = None
+            last_exc = None
+            for dw, dh in dict.fromkeys(depth_candidates):
+                cfg = rs.config()
+                cfg.enable_stream(rs.stream.color, self.width, self.height,
+                                  rs.format.bgr8, self.fps)
+                cfg.enable_stream(rs.stream.depth, dw, dh,
+                                  rs.format.z16, self.fps)
+                try:
+                    profile = pipeline.start(cfg)
+                    self._depth_res = (dw, dh)
+                    break
+                except Exception as e:
+                    last_exc = e
+            if profile is None:
+                raise last_exc or RuntimeError("no supported stream combination")
             dev = profile.get_device()
             self._serial = dev.get_info(rs.camera_info.serial_number)
             self._depth_scale = float(dev.first_depth_sensor().get_depth_scale())
@@ -119,8 +135,9 @@ class RealsenseCamera:
                 color = np.asanyarray(c.get_data()).copy()
                 depth = np.asanyarray(d.get_data()).copy()
                 with self._lock:
+                    self._seq += 1
                     self._frames = {"color": color, "depth": depth,
-                                    "ts": time.time()}
+                                    "ts": time.time(), "id": self._seq}
             except Exception as e:
                 if self._running:
                     self._last_error = str(e)
@@ -144,6 +161,56 @@ class RealsenseCamera:
         with self._lock:
             return self._frames
 
+    # ------------------------------------------------------------------ #
+    # configuration
+    # ------------------------------------------------------------------ #
+    def supported_modes(self):
+        """Common D435 (width, height, fps) modes for the color and depth
+        streams. STATIC table on purpose: live device enumeration via
+        rs.context() can segfault librealsense when the USB device is in a
+        stale state (e.g. right after an unclean worker restart), taking the
+        whole server down. set_config() validates the requested mode against
+        the real device anyway (with rollback), so this list is guidance."""
+        return {
+            "color": [[424, 240, f] for f in (6, 15, 30, 60)] +
+                     [[640, 360, f] for f in (6, 15, 30, 60)] +
+                     [[640, 480, f] for f in (6, 15, 30, 60)] +
+                     [[848, 480, f] for f in (6, 15, 30, 60)] +
+                     [[1280, 720, f] for f in (6, 15, 30)] +
+                     [[1920, 1080, f] for f in (6, 15, 30)],
+            "depth": [[424, 240, f] for f in (6, 15, 30, 60, 90)] +
+                     [[480, 270, f] for f in (6, 15, 30, 60, 90)] +
+                     [[640, 360, f] for f in (6, 15, 30, 60, 90)] +
+                     [[640, 480, f] for f in (6, 15, 30, 60, 90)] +
+                     [[848, 480, f] for f in (6, 15, 30, 60, 90)] +
+                     [[1280, 720, f] for f in (6, 15, 30)],
+            "note": "curated common D435 modes; the actual gate is the device "
+                    "itself -- /camera/config validates and rolls back on failure",
+        }
+
+    def set_config(self, width=None, height=None, fps=None):
+        """Apply a new color-stream configuration, restarting the stream to
+        validate it against the real device. On failure the previous config is
+        restored (and restarted if it was running). Returns (ok, err)."""
+        old = (self.width, self.height, self.fps)
+        was_running = self._running
+        new = (int(width) if width else old[0],
+               int(height) if height else old[1],
+               int(fps) if fps else old[2])
+        if new == old and was_running:
+            return True, None
+        if was_running:
+            self.stop()
+        self.width, self.height, self.fps = new
+        ok, err = self.ensure_started()
+        if not ok:
+            # roll back so a bad request can't leave the camera dead
+            self.width, self.height, self.fps = old
+            if was_running:
+                self.ensure_started()
+            return False, err
+        return True, None
+
     def info(self):
         """Status + intrinsics dict for /camera/info."""
         fr = self.latest()
@@ -152,6 +219,7 @@ class RealsenseCamera:
             "has_frame": fr is not None,
             "width": self.width, "height": self.height, "fps": self.fps,
             "serial": self._serial,
+            "depth_sensor_res": self._depth_res,  # aligned output is color-sized
             "depth_scale_m": self._depth_scale,
             "last_error": self._last_error,
         }
@@ -195,6 +263,22 @@ class RealsenseCamera:
             out["point_camera_m"] = {"x": round(x, 4), "y": round(y, 4),
                                      "z": round(z, 4)}
         return out
+
+    def frame_bundle(self):
+        """One CONSISTENT snapshot: color + depth (converted to uint16 mm)
+        taken from the same frameset, plus frame id/timestamp and intrinsics.
+        Guarantees pixel-level color/depth pairing (single latest() read)."""
+        fr = self.latest()
+        if fr is None or self._depth_scale is None:
+            return None
+        mm = np.clip(fr["depth"].astype(np.float32) * (self._depth_scale * 1000.0),
+                     0, 65535).astype(np.uint16)
+        i = self._intrinsics
+        return {"color": fr["color"], "depth_mm": mm,
+                "ts": fr["ts"], "id": fr.get("id", 0),
+                "fx": i.fx if i else 0.0, "fy": i.fy if i else 0.0,
+                "ppx": i.ppx if i else 0.0, "ppy": i.ppy if i else 0.0,
+                "depth_scale_m": self._depth_scale}
 
     def depth_mm(self):
         """Aligned depth converted to uint16 MILLIMETERS (0 = no data)."""
