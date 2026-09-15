@@ -3,13 +3,14 @@
 import logging
 import os
 import signal
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from threading import Lock
 
 # Log
 from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits, is_user_stop_abort
 from force_viz import ForceVisualizer
 from payload_id import PayloadIdentifier
+from realsense_cam import RealsenseCamera
 import rospy
 from rosgraph_msgs.msg import Log
 
@@ -163,6 +164,134 @@ def web_ui():
     except OSError:
         return jsonify({"error": "webui.html not found next to restful.py"}), 404
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+# ----- Intel RealSense D435 (color + depth over HTTP) -----
+# Constructing the object is cheap (no USB access); the device opens lazily on
+# the first /camera request, so the debug reloader's supervisor process never
+# claims the camera. All camera endpoints are lock-free w.r.t. robot motion.
+camera = RealsenseCamera()
+
+
+def _camera_unavailable(err):
+    return jsonify({"error": "camera_unavailable",
+                    "msg": err or "RealSense D435 not reachable"}), 503
+
+
+@app.route('/camera/info', methods=['GET'])
+def camera_info():
+    """D435 status + color-stream intrinsics (fx, fy, ppx, ppy, coeffs),
+    depth_scale_m, frame age. Does not start the camera; use /camera/start or
+    any image endpoint to start streaming."""
+    return jsonify(camera.info()), 200
+
+
+@app.route('/camera/start', methods=['GET'])
+def camera_start():
+    """Start the D435 stream (color 640x480 + depth aligned to color).
+    Idempotent; image endpoints also auto-start. 503 if the device is missing
+    or busy."""
+    ok, err = camera.ensure_started()
+    if not ok:
+        return _camera_unavailable(err)
+    return jsonify({"status": "streaming", **camera.info()}), 200
+
+
+@app.route('/camera/stop', methods=['GET'])
+def camera_stop():
+    """Stop the stream and release the USB device."""
+    camera.stop()
+    return jsonify({"status": "stopped"}), 200
+
+
+@app.route('/camera/color', methods=['GET'])
+def camera_color():
+    """Latest color frame as JPEG (auto-starts the camera). Query:
+    quality=1..100 (default 85). Viewable directly in a browser."""
+    ok, err = camera.ensure_started()
+    if not ok:
+        return _camera_unavailable(err)
+    try:
+        quality = int(request.args.get("quality", "85"))
+    except ValueError:
+        return jsonify({"error": "bad quality"}), 400
+    fr = camera.latest()
+    if fr is None:
+        return _camera_unavailable("no frame yet")
+    import cv2
+    ok2, buf = cv2.imencode(".jpg", fr["color"],
+                            [cv2.IMWRITE_JPEG_QUALITY, max(1, min(100, quality))])
+    if not ok2:
+        return jsonify({"error": "jpeg encode failed"}), 500
+    return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
+@app.route('/camera/depth', methods=['GET'])
+def camera_depth():
+    """Latest aligned depth frame as 16-bit PNG in MILLIMETERS (0 = no data).
+    Lossless; pixel (u,v) corresponds to the same (u,v) in /camera/color.
+    Convert to meters: value / 1000."""
+    ok, err = camera.ensure_started()
+    if not ok:
+        return _camera_unavailable(err)
+    mm = camera.depth_mm()
+    if mm is None:
+        return _camera_unavailable("no frame yet")
+    import cv2
+    ok2, buf = cv2.imencode(".png", mm)
+    if not ok2:
+        return jsonify({"error": "png encode failed"}), 500
+    resp = Response(buf.tobytes(), mimetype="image/png")
+    resp.headers["X-Depth-Units"] = "millimeters"
+    return resp
+
+
+@app.route('/camera/depth/preview', methods=['GET'])
+def camera_depth_preview():
+    """Colorized depth as JPEG for humans (JET colormap; query max_m=4.0 sets
+    the far clip in meters; black = no data). For real data use /camera/depth."""
+    ok, err = camera.ensure_started()
+    if not ok:
+        return _camera_unavailable(err)
+    try:
+        max_m = float(request.args.get("max_m", "4.0"))
+        if not (0.1 <= max_m <= 20):
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "bad max_m (0.1..20)"}), 400
+    img = camera.depth_preview_bgr(max_m=max_m)
+    if img is None:
+        return _camera_unavailable("no frame yet")
+    import cv2
+    ok2, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok2:
+        return jsonify({"error": "jpeg encode failed"}), 500
+    return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
+@app.route('/camera/depth_at', methods=['GET'])
+def camera_depth_at():
+    """Depth at pixel (u,v) of the aligned images: median over a win x win
+    window (default 5), zeros ignored. Returns depth_m and the deprojected 3D
+    point_camera_m in the CAMERA frame (x right, y down, z forward, meters).
+    Query: u=<0..639> v=<0..479> [win=5]."""
+    ok, err = camera.ensure_started()
+    if not ok:
+        return _camera_unavailable(err)
+    try:
+        u = int(request.args.get("u"))
+        v = int(request.args.get("v"))
+        win = int(request.args.get("win", "5"))
+        if not (1 <= win <= 51):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "need integer u, v (and optional win 1..51)"}), 400
+    out = camera.depth_at(u, v, win=win)
+    if out is None:
+        return _camera_unavailable("no frame yet")
+    if "error" in out:
+        return jsonify(out), 400
+    return jsonify(out), 200
 
 
 # Fixed target only (no ?url= override -- that would make this an open proxy /

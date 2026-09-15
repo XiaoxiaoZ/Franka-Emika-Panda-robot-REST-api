@@ -11,6 +11,7 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 - **Health probe** — quick `/health` check to diagnose a stuck server without restarting
 - **Self-documenting** — `GET /help` returns a machine-readable guide to every endpoint (params, conventions, quickstart)
 - **Web control panel** — open `http://<host>:5000/ui` from any browser on the network (phone/tablet/PC, zero install): presets, detect &amp; pick, gripper + force grasp, MoveL jog, live pose/force, STOP
+- **RealSense D435 camera** — color JPEG, aligned 16-bit depth PNG, per-pixel depth + 3D point, and intrinsics over plain HTTP (`/camera/*`)
 
 ## Endpoints
 
@@ -31,6 +32,23 @@ A Flask-based RESTful API for controlling the Franka Emika Panda robot via ROS +
 - `GET /detect_proxy`
   Server-side proxy to the vision `/detect` service (avoids browser CORS). Target is
   fixed at server start (`FRANKA_DETECT_URL`, default `http://172.26.0.205:5000/detect`).
+
+### Camera (Intel RealSense D435)
+
+Color + depth over plain HTTP. The device opens lazily on the first request;
+depth is **aligned to color**, so pixel `(u,v)` indexes the same point in both
+images. Camera endpoints never block robot motion. Needs `pyrealsense2`
+(installed user-level; the server extends `sys.path` to find it under sudo).
+
+- `GET /camera/info` — status, serial, `depth_scale_m`, color intrinsics (`fx, fy, ppx, ppy`, coeffs), frame age.
+- `GET /camera/start` / `GET /camera/stop` — start (idempotent; image endpoints auto-start) / release the USB device.
+- `GET /camera/color?quality=85` — latest color frame as JPEG (browser-viewable).
+- `GET /camera/depth` — latest aligned depth as **16-bit PNG in millimeters** (0 = no data; lossless).
+- `GET /camera/depth/preview?max_m=4.0` — colorized depth JPEG for humans (black = no data).
+- `GET /camera/depth_at?u=&v=&win=5` — median depth (m) in a window at pixel `(u,v)` plus the deprojected 3D `point_camera_m` (camera frame: x right, y down, z forward).
+
+> D435 minimum range is ~0.28 m at 640×480 — closer surfaces (and shiny metal)
+> return no depth (0 / black in the preview).
 
 - `GET /state`
   Get current pose and gripper state. `gripper`: 1 = open, 0 = closed.
