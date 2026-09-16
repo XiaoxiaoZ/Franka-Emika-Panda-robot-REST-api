@@ -256,8 +256,9 @@ Some parts of this codebase are known-limited or known-broken. Expect follow-up 
 ## Notes
 
 - **Virtual safety walls + ceiling**: at startup two transparent red walls are added
-  to the planning scene at `x = -0.45` and `y = -0.45` (base frame), fencing the arm
-  into the working quadrant, plus a ceiling slab whose underside is 5 cm below the
+  to the planning scene at `x = -0.30` and `y = -0.45` (base frame), fencing the arm
+  into the working quadrant (the x wall is tight so the wrist cannot swing back
+  over the base), plus a ceiling slab whose underside is 5 cm below the
   real ceiling (`VIRTUAL_CEILING_Z = 1.13` m above the base). MoveIt rejects any plan
   that would sweep a link into the regions where people stand or into the ceiling.
   Adjust in `add_virtual_walls()` / `VIRTUAL_CEILING_Z` (franka.py). If the arm is

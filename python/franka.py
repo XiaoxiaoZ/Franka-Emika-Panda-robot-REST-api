@@ -1062,11 +1062,15 @@ class MoveGroupPythonInterfaceTutorial(object):
 
     def add_virtual_walls(self, ceiling_z=None):
         """Two virtual walls plus a ceiling fencing the arm into the working
-        region (x > -0.45, y > -0.45, z < ceiling): people stand in the other
+        region (x > -0.30, y > -0.45, z < ceiling): people stand in the other
         quadrants and there is a low ceiling above the base. With these in the
         planning scene MoveIt refuses any plan that would sweep a link into them.
-        Both walls sit at -0.45 for clearance, which also keeps the legacy CAMERA
-        photo pose at y=-0.27 reachable (user decision, 2026-09-15). The ceiling
+        The y wall sits at -0.45, which keeps the legacy CAMERA photo pose at
+        y=-0.27 reachable (user decision, 2026-09-15). The x wall was pulled in
+        to -0.30 (2026-09-16) so the wrist can no longer swing back over the base
+        (the pose that hit the ceiling had link6/7 at x=-0.19..-0.24); the home
+        pose's elbow at x=-0.22 is still clear (verified with
+        /check_state_validity). The ceiling
         slab's underside is VIRTUAL_CEILING_MARGIN below the real ceiling
         (``ceiling_z``, default VIRTUAL_CEILING_Z). All are colored transparent
         red in RViz."""
@@ -1102,7 +1106,7 @@ class MoveGroupPythonInterfaceTutorial(object):
         wanted = {"virtual_wall_y", "virtual_wall_x", "virtual_ceiling"}
         for _attempt in range(6):
             _wall("virtual_wall_y", 0.0, -0.45, 2.0, 0.02)   # blocks y < -0.45
-            _wall("virtual_wall_x", -0.45, 0.0, 0.02, 2.0)   # blocks x < -0.45
+            _wall("virtual_wall_x", -0.30, 0.0, 0.02, 2.0)   # blocks x < -0.30
             _box("virtual_ceiling", 0.0, 0.0, ceil_bottom + ceil_sz / 2.0,
                  2.0, 2.0, ceil_sz)                          # blocks z > ceil_bottom
             _time.sleep(0.5)
