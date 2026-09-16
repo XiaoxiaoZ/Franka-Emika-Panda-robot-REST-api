@@ -255,10 +255,14 @@ Some parts of this codebase are known-limited or known-broken. Expect follow-up 
 
 ## Notes
 
-- **Virtual safety walls**: at startup two transparent red walls are added to the
-  planning scene at `x = -0.45` and `y = -0.45` (base frame), fencing the arm into
-  the working quadrant — MoveIt rejects any plan that would sweep a link into the
-  regions where people stand. Adjust in `add_virtual_walls()` (franka.py).
+- **Virtual safety walls + ceiling**: at startup two transparent red walls are added
+  to the planning scene at `x = -0.45` and `y = -0.45` (base frame), fencing the arm
+  into the working quadrant, plus a ceiling slab whose underside is 5 cm below the
+  real ceiling (`VIRTUAL_CEILING_Z = 1.13` m above the base). MoveIt rejects any plan
+  that would sweep a link into the regions where people stand or into the ceiling.
+  Adjust in `add_virtual_walls()` / `VIRTUAL_CEILING_Z` (franka.py). If the arm is
+  already inside the slab when the server starts (e.g. after bumping the ceiling),
+  planning from that start state fails — hand-guide it down first.
 - The API must run in a shell with ROS sourced (`source /opt/ros/noetic/setup.bash` + your workspace).
 - Motion endpoints serialize via a non-blocking lock — concurrent motion requests get 409 "Robot is busy" rather than queuing.
 - Motions apply an orientation path constraint (±0.5 rad) to prevent mid-path IK flips. Constraint is suppressed when `preserve_orientation=0` (so the wrist is allowed to freely reorient to the new target).

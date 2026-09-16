@@ -1054,12 +1054,24 @@ class MoveGroupPythonInterfaceTutorial(object):
         self.box_name = box_name
         return self.wait_for_state_update(box_is_known=True, timeout=timeout)
     
-    def add_virtual_walls(self):
-        """Two virtual walls fencing the arm into the working region
-        (x > -0.45, y > -0.45): people stand in the other quadrants, and with
-        these in the planning scene MoveIt refuses any plan that would sweep a
-        link into them. Both walls sit at -0.45 for clearance, which also keeps the
-        legacy CAMERA photo pose at y=-0.27 reachable (user decision, 2026-09-15). Walls are colored transparent red in RViz."""
+    # Real ceiling height above the robot base (panda_link0), metres. Measured
+    # 2026-09-16 from the pose the arm was in when it bumped the ceiling
+    # (fingertips at z=1.13). The virtual slab starts CEILING_MARGIN below it.
+    VIRTUAL_CEILING_Z = 1.13
+    VIRTUAL_CEILING_MARGIN = 0.05
+
+    def add_virtual_walls(self, ceiling_z=None):
+        """Two virtual walls plus a ceiling fencing the arm into the working
+        region (x > -0.45, y > -0.45, z < ceiling): people stand in the other
+        quadrants and there is a low ceiling above the base. With these in the
+        planning scene MoveIt refuses any plan that would sweep a link into them.
+        Both walls sit at -0.45 for clearance, which also keeps the legacy CAMERA
+        photo pose at y=-0.27 reachable (user decision, 2026-09-15). The ceiling
+        slab's underside is VIRTUAL_CEILING_MARGIN below the real ceiling
+        (``ceiling_z``, default VIRTUAL_CEILING_Z). All are colored transparent
+        red in RViz."""
+        if ceiling_z is None:
+            ceiling_z = self.VIRTUAL_CEILING_Z
         import time as _time
         from moveit_msgs.msg import PlanningScene, ObjectColor
         from std_msgs.msg import ColorRGBA
@@ -1067,22 +1079,32 @@ class MoveGroupPythonInterfaceTutorial(object):
         scene = self.scene
         frame = self.move_group.get_planning_frame()
 
-        def _wall(name, cx, cy, sx, sy):
+        def _box(name, cx, cy, cz, sx, sy, sz):
             pose = geometry_msgs.msg.PoseStamped()
             pose.header.frame_id = frame
             pose.pose.orientation.w = 1.0
             pose.pose.position.x = cx
             pose.pose.position.y = cy
-            pose.pose.position.z = 0.7          # spans z 0..1.4
-            scene.add_box(name, pose, size=(sx, sy, 1.4))
+            pose.pose.position.z = cz
+            scene.add_box(name, pose, size=(sx, sy, sz))
+
+        def _wall(name, cx, cy, sx, sy):
+            _box(name, cx, cy, 0.7, sx, sy, 1.4)   # spans z 0..1.4
+
+        # Thick slab whose underside sits at ceiling_z - margin; the arm can
+        # never reach above ~1.2 m anyway, so 0.5 m thickness covers it.
+        ceil_sz = 0.5
+        ceil_bottom = ceiling_z - self.VIRTUAL_CEILING_MARGIN
 
         # The PSI publisher is asynchronous and silently drops messages until
         # it is connected to move_group (bites right after a server restart),
         # so add-and-verify with retries against the reliable scene service.
-        wanted = {"virtual_wall_y", "virtual_wall_x"}
+        wanted = {"virtual_wall_y", "virtual_wall_x", "virtual_ceiling"}
         for _attempt in range(6):
             _wall("virtual_wall_y", 0.0, -0.45, 2.0, 0.02)   # blocks y < -0.45
             _wall("virtual_wall_x", -0.45, 0.0, 0.02, 2.0)   # blocks x < -0.45
+            _box("virtual_ceiling", 0.0, 0.0, ceil_bottom + ceil_sz / 2.0,
+                 2.0, 2.0, ceil_sz)                          # blocks z > ceil_bottom
             _time.sleep(0.5)
             try:
                 if wanted.issubset(set(scene.get_known_object_names())):
@@ -1099,7 +1121,7 @@ class MoveGroupPythonInterfaceTutorial(object):
             _time.sleep(0.5)  # let the publisher connect to move_group
             ps = PlanningScene()
             ps.is_diff = True
-            for name in ("virtual_wall_y", "virtual_wall_x"):
+            for name in wanted:
                 oc = ObjectColor()
                 oc.id = name
                 oc.color = ColorRGBA(r=1.0, g=0.25, b=0.2, a=0.35)
