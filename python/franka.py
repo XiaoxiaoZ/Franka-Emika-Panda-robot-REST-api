@@ -552,7 +552,7 @@ class MoveGroupPythonInterfaceTutorial(object):
                   "target_joint": joint_index + 1, "target_value_rad": round(joint_goal[joint_index], 4)}
         try:
             move_group.set_joint_value_target(joint_goal)
-            for planner_id in ("RRTConnectkConfigDefault", ""):
+            for planner_id in ("RRTConnect", ""):
                 move_group.set_planner_id(planner_id)
                 result["planner_tried"].append(planner_id or "(default)")
                 plan_success, plan, planning_time, error_code = move_group.plan()
@@ -614,7 +614,7 @@ class MoveGroupPythonInterfaceTutorial(object):
                   "joint_goal": [round(v, 5) for v in goal]}
         try:
             move_group.set_joint_value_target(goal)
-            for planner_id in ("RRTConnectkConfigDefault", ""):
+            for planner_id in ("RRTConnect", ""):
                 move_group.set_planner_id(planner_id)
                 result["planner_tried"].append(planner_id or "(default)")
                 plan_success, plan, planning_time, error_code = move_group.plan()
@@ -657,7 +657,7 @@ class MoveGroupPythonInterfaceTutorial(object):
         result = {"planner_tried": [], "plan_error_codes": [], "executed": False}
         try:
             move_group.set_joint_value_target(joint_goal)
-            for planner_id in ("RRTConnectkConfigDefault", ""):
+            for planner_id in ("RRTConnect", ""):
                 move_group.set_planner_id(planner_id)
                 result["planner_tried"].append(planner_id or "(default)")
                 plan_success, plan, planning_time, error_code = move_group.plan()
@@ -1015,7 +1015,7 @@ class MoveGroupPythonInterfaceTutorial(object):
         # planner_id:
         #   "LIN" (default): Pilz straight-line-in-cartesian. Good for precise
         #        short moves; prone to joint-limit drift on large workspace sweeps.
-        #   "RRTConnectkConfigDefault": OMPL joint-space sampling. Path is not
+        #   "RRTConnect": OMPL joint-space sampling. Path is not
         #        straight in cartesian space, but plans are naturally limit-aware.
         #        Use for large motions where straight-line isn't required.
         move_group = self.move_group

@@ -108,7 +108,7 @@ _HELP_NOTES = {
     "/control/gripper_open_force": "Force-based open via franka_gripper/move. Params: width=0.08, speed=0.1, timeout=10, auto_recover=1, max_retries=1.",
     "/control/gripper_grasp": "Force-based grasp via franka_gripper/grasp; closes until contact then applies force. Params: width=0.0, speed=0.05, force=20 (N), eps_in=0.005, eps_out=0.005 (widen to 0.08 for unknown widths), timeout=10, auto_recover=1, max_retries=1 (use max_retries=0 while transporting a held object).",
     "/control/plan_cartesian_path": "Straight-line (MoveL) move to ABSOLUTE x,y,z in meters. Optional TCP orientation target: roll&pitch&yaw (degrees, base frame, sxyz; straight down = 180,0,0) or qx&qy&qz&qw quaternion -- overrides preserve_orientation. Other params: auto_recover=1, max_retries=1, preserve_orientation=1 (0 = reset to canonical down), max_joint_travel_deg=100 (big-swing guard: plans that wind any joint further are rejected with 409 plan_too_large; 0 disables). WARNING: moves the arm.",
-    "/control/plan_joint_path": "Joint-space plan+execute to x,y,z. Same params as plan_cartesian_path (incl. roll/pitch/yaw or qx..qw orientation target) plus planner_id=LIN|RRTConnectkConfigDefault (use LIN for a minimal in-place reorientation, RRTConnect for large moves; RRTConnect goals are solved by IK seeded from the current joints so the arm keeps its configuration, and the least-travel of 3 plans is used). WARNING: moves the arm.",
+    "/control/plan_joint_path": "Joint-space plan+execute to x,y,z. Same params as plan_cartesian_path (incl. roll/pitch/yaw or qx..qw orientation target) plus planner_id=LIN|RRTConnect (use LIN for a minimal in-place reorientation, RRTConnect for large moves; RRTConnect goals are solved by IK seeded from the current joints so the arm keeps its configuration, and the least-travel of 3 plans is used). WARNING: moves the arm.",
     "/simulation/add_box": "Add the fixed demo box to the planning scene.",
     "/simulation/remove_box": "Remove the demo box from the planning scene.",
     "/simulation/attach_box": "Attach the demo box to the gripper (collision-checked as part of the hand).",
@@ -815,7 +815,7 @@ def _format_motion_response(outcome, extra=None):
         return jsonify({**body, "msg": "Plan not 100%"}), 202
     if outcome['outcome'] == 'plan_would_violate_limits':
         body["trajectory_violations"] = outcome.get('trajectory_violations', [])
-        body["hint"] = "plan would drive a joint near its limit mid-path; try a different target, preserve_orientation=0, or plan_joint_path with planner_id=RRTConnectkConfigDefault"
+        body["hint"] = "plan would drive a joint near its limit mid-path; try a different target, preserve_orientation=0, or plan_joint_path with planner_id=RRTConnect"
         return jsonify({**body, "msg": "plan rejected: would drift a joint past safe margin"}), 409
     if outcome['outcome'] == 'plan_too_large':
         body["joint_travel_deg"] = {j: round(math.degrees(t), 1) for j, t in outcome.get('joint_travel', {}).items()}
@@ -931,6 +931,10 @@ def plan_joint_path():
     try:
         x, y, z, auto_recover, max_retries, preserve_orientation, orientation = _parse_motion_args()
         planner_id = request.args.get("planner_id", "LIN")
+        # Legacy (Kinetic-era) OMPL planner id; Noetic's panda_moveit_config
+        # names it plain "RRTConnect" and warns + falls back on the old name.
+        if planner_id == "RRTConnectkConfigDefault":
+            planner_id = "RRTConnect"
         max_joint_travel = _parse_max_joint_travel()
     except (TypeError, ValueError) as e:
         return jsonify({"error": "bad motion args", "msg": str(e)}), 400
