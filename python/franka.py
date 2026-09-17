@@ -774,6 +774,8 @@ class MoveGroupPythonInterfaceTutorial(object):
             if traj_check_margin_rad is not None:
                 traj_violations = check_trajectory_for_limits(plan, margin_rad=traj_check_margin_rad)
                 if traj_violations:
+                    rospy.logwarn("plan rejected: would drive a joint within %.2f rad of its limit: %s",
+                                  traj_check_margin_rad, traj_violations[:3])
                     return {
                         'outcome': 'plan_would_violate_limits',
                         'recovery_triggered': recovery_triggered,

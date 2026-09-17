@@ -779,6 +779,17 @@ def _preflight_joint_limit_check():
 
 def _format_motion_response(outcome, extra=None):
     """Translate plan_and_execute_with_retry outcome dict into (json_body, status)."""
+    resp = _format_motion_response_inner(outcome, extra)
+    try:
+        log.info("motion %s -> HTTP %s outcome=%s attempts=%s from %s",
+                 request.full_path, resp[1], outcome.get('outcome'), outcome.get('attempts'),
+                 request.remote_addr)
+    except Exception:
+        pass
+    return resp
+
+
+def _format_motion_response_inner(outcome, extra=None):
     body = {
         "outcome": outcome['outcome'],
         "attempts": outcome['attempts'],
