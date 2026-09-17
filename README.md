@@ -265,7 +265,7 @@ Some parts of this codebase are known-limited or known-broken. Expect follow-up 
   already inside the slab when the server starts (e.g. after bumping the ceiling),
   planning from that start state fails — hand-guide it down first.
 - **Big-swing guard** (2026-09-17): every motion endpoint rejects a plan whose
-  cumulative travel on any joint exceeds `max_joint_travel_deg` (default 100°,
+  cumulative travel on any joint (except wrist roll J7) exceeds `max_joint_travel_deg` (default 100°,
   `MAX_JOINT_TRAVEL_RAD` in franka.py) with `409 plan_too_large` and the per-joint
   travel, instead of letting a sampling planner spin the base / flip the elbow.
   Pass a bigger value (or `0` to disable) when a large move is intended. Joint-space

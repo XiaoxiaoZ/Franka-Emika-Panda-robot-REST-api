@@ -691,6 +691,10 @@ class MoveGroupPythonInterfaceTutorial(object):
     # use far less, and even home -> table pick needs only ~90 deg on the
     # shoulder; a rejected plan tells the caller to go in steps.
     MAX_JOINT_TRAVEL_RAD = 1.75
+    # Per-joint exceptions to the guard (None = not checked). Wrist roll
+    # (joint 7) only spins the flange about the tool axis: it moves nothing
+    # else and is dictated by the requested yaw, so it is not a "swing".
+    JOINT_TRAVEL_EXEMPT = ("panda_joint7",)
 
     def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1, get_last_error=None,
                                     traj_check_margin_rad=0.02, max_joint_travel_rad=None):
@@ -715,6 +719,7 @@ class MoveGroupPythonInterfaceTutorial(object):
 
         max_joint_travel_rad: reject plans whose cumulative per-joint travel
           exceeds this (None -> MAX_JOINT_TRAVEL_RAD; 0 disables the check).
+          Joints in JOINT_TRAVEL_EXEMPT (wrist roll) are not checked.
 
         Returns dict:
           outcome: 'success' | 'plan_failed' | 'execute_failed' |
@@ -782,7 +787,8 @@ class MoveGroupPythonInterfaceTutorial(object):
             # way even though start and goal poses may be close.
             if max_joint_travel_rad:
                 travel = trajectory_joint_travel(plan)
-                too_far = {j: round(t, 3) for j, t in travel.items() if t > max_joint_travel_rad}
+                too_far = {j: round(t, 3) for j, t in travel.items()
+                           if t > max_joint_travel_rad and j not in self.JOINT_TRAVEL_EXEMPT}
                 if too_far:
                     rospy.logwarn("plan rejected: joint travel %s exceeds %.2f rad", too_far, max_joint_travel_rad)
                     return {
