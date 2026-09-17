@@ -888,28 +888,81 @@ class MoveGroupPythonInterfaceTutorial(object):
 
     # Weights for picking among IK solutions: swinging the whole arm round
     # (joint 1) or flipping the elbow (joint 3) is what reads as a "big
-    # motion" to bystanders; wrist roll (7) barely matters.
-    IK_JOINT_WEIGHTS = (2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 0.5)
+    # motion" to bystanders; wrist roll (7) only spins the flange, so it is
+    # cheap -- let it take the yaw so the big joints stay put.
+    IK_JOINT_WEIGHTS = (2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 0.15)
+    # IK solutions with any joint closer than this to a limit are skipped:
+    # the trajectory limit check (0.02 rad) would reject them anyway, and
+    # the wrist roll in particular tends to land exactly on +-2.8973.
+    IK_LIMIT_MARGIN_RAD = 0.05
 
     def _ik_near_current(self, pose, timeout=0.2):
-        """Joint values reaching ``pose`` (base frame) that stay closest to
-        the current configuration. /compute_ik (collision-aware) is run from
-        several seeds -- the current joints, plus "natural" configurations
-        with the base joint pointed at the target and the redundant joints
-        (3, 5) zeroed, since seeding from the current state alone still
-        happily returns a base-spun elbow-swung solution -- and the solution
-        with the smallest max joint delta from the current joints wins.
-        Returns a 7-list or None if every seed fails."""
+        """Joint values reaching ``pose`` (base frame, tool = panda_hand_tcp)
+        that stay closest to the current configuration.
+
+        First choice: the analytical Panda IK (panda_ik) swept over the
+        redundant wrist-roll q7, which enumerates every configuration for
+        the pose; solutions are FK-verified, limit-clear (IK_LIMIT_MARGIN_RAD)
+        and sorted by weighted joint delta from the current joints, and the
+        first one that /check_state_validity reports collision-free wins.
+        Fallback: /compute_ik (KDL) from a few seeds -- KDL ignores the seed
+        for the most part and likes to park q7 on its limit, which is why the
+        analytic sweep exists. Returns a 7-list or None."""
+        names = self.move_group.get_active_joints()
+        cur_state = self.robot.get_current_state()
+        cur_lookup = dict(zip(cur_state.joint_state.name, cur_state.joint_state.position))
+        current = [cur_lookup[n] for n in names]
+
+        sol = self._ik_analytic(pose, current, names, cur_state)
+        if sol is not None:
+            return sol
+        return self._ik_kdl_seeded(pose, current, names, cur_state, timeout)
+
+    def _ik_analytic(self, pose, current, names, cur_state, max_collision_checks=25):
+        import math as _math
+        try:
+            import panda_ik
+            from tf.transformations import quaternion_matrix
+            from moveit_msgs.srv import GetStateValidity, GetStateValidityRequest
+            if self.move_group.get_end_effector_link() != "panda_hand_tcp":
+                return None
+            T = quaternion_matrix([pose.orientation.x, pose.orientation.y,
+                                   pose.orientation.z, pose.orientation.w])
+            T[:3, 3] = [pose.position.x, pose.position.y, pose.position.z]
+            sols = panda_ik.solutions_near(T, current, weights=self.IK_JOINT_WEIGHTS,
+                                           limit_margin=self.IK_LIMIT_MARGIN_RAD)
+            if not sols:
+                rospy.loginfo("analytic IK: no limit-clear solution for the pose")
+                return None
+            rospy.wait_for_service("/check_state_validity", timeout=2.0)
+            validity = rospy.ServiceProxy("/check_state_validity", GetStateValidity)
+            idx = [list(cur_state.joint_state.name).index(n) for n in names]
+            for k, (cost, q) in enumerate(sols[:max_collision_checks]):
+                st = copy.deepcopy(cur_state)
+                pos = list(st.joint_state.position)
+                for i, v in zip(idx, q):
+                    pos[i] = v
+                st.joint_state.position = pos
+                req = GetStateValidityRequest(robot_state=st, group_name=self.move_group.get_name())
+                if validity(req).valid:
+                    rospy.loginfo("analytic IK: picked #%d of %d, cost %.2f, deltas deg %s",
+                                  k, len(sols), cost,
+                                  [int(round(_math.degrees(a - b))) for a, b in zip(q, current)])
+                    return q
+            rospy.logwarn("analytic IK: the %d closest solutions are all in collision",
+                          min(len(sols), max_collision_checks))
+            return None
+        except Exception as e:
+            rospy.logwarn("analytic IK unavailable (%s)", e)
+            return None
+
+    def _ik_kdl_seeded(self, pose, current, names, cur_state, timeout=0.2):
         import math as _math
         from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
         move_group = self.move_group
         try:
             rospy.wait_for_service("/compute_ik", timeout=2.0)
             ik = rospy.ServiceProxy("/compute_ik", GetPositionIK)
-            names = move_group.get_active_joints()
-            cur_state = self.robot.get_current_state()
-            cur_lookup = dict(zip(cur_state.joint_state.name, cur_state.joint_state.position))
-            current = [cur_lookup[n] for n in names]
 
             j1_target = _math.atan2(pose.position.y, pose.position.x)
             seeds = [current]
@@ -941,13 +994,16 @@ class MoveGroupPythonInterfaceTutorial(object):
                     continue
                 lookup = dict(zip(res.solution.joint_state.name, res.solution.joint_state.position))
                 sol = [lookup[n] for n in names]
+                if check_joint_limits(sol, margin_rad=self.IK_LIMIT_MARGIN_RAD):
+                    continue    # sits on a joint limit; not executable
                 cost = max(w * abs(a - b) for w, a, b in zip(self.IK_JOINT_WEIGHTS, sol, current))
                 if cost < best_cost:
                     best, best_cost = sol, cost
             if best is None:
-                rospy.logwarn("seeded IK failed from every seed; falling back to pose goal")
+                rospy.logwarn("seeded IK: no limit-clear solution from any seed; falling back to pose goal")
                 return None
-            rospy.loginfo("seeded IK: max joint delta %.2f rad", best_cost)
+            rospy.loginfo("seeded IK: weighted cost %.2f, deltas j1 %.2f j3 %.2f j7 %.2f rad",
+                          best_cost, best[0] - current[0], best[2] - current[2], best[6] - current[6])
             return best
         except Exception as e:
             rospy.logwarn("seeded IK unavailable (%s); falling back to pose goal", e)
