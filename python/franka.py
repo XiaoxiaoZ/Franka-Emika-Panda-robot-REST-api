@@ -801,7 +801,15 @@ class MoveGroupPythonInterfaceTutorial(object):
                         'max_joint_travel_rad': max_joint_travel_rad,
                     }
 
+            travel = trajectory_joint_travel(plan)
+            rospy.loginfo("executing plan: attempt %d, %d waypoints, max joint travel %.2f rad (%s)",
+                          attempts, len(plan.joint_trajectory.points),
+                          max(travel.values() or [0.0]),
+                          max(travel, key=travel.get) if travel else "-")
             ok = self.execute_plan(plan)
+            rospy.loginfo("execute returned %s (stop_requested=%s, last_error=%s)",
+                          ok, self._stop_requested,
+                          get_last_error() if get_last_error else None)
             # If the user called /control/stop during execution, execute_plan
             # will have returned False due to the aborted trajectory. Do NOT
             # auto-retry in that case -- the stop was intentional.
