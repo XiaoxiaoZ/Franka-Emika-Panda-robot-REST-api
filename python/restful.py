@@ -1,6 +1,7 @@
 # Using flask to make an api
 # import necessary libraries and functions
 import logging
+import math
 import os
 import signal
 from flask import Flask, Response, jsonify, request
@@ -106,8 +107,8 @@ _HELP_NOTES = {
     "/control/gripper_close": "MoveIt gripper close shortcut (0.01 m). No force feedback.",
     "/control/gripper_open_force": "Force-based open via franka_gripper/move. Params: width=0.08, speed=0.1, timeout=10, auto_recover=1, max_retries=1.",
     "/control/gripper_grasp": "Force-based grasp via franka_gripper/grasp; closes until contact then applies force. Params: width=0.0, speed=0.05, force=20 (N), eps_in=0.005, eps_out=0.005 (widen to 0.08 for unknown widths), timeout=10, auto_recover=1, max_retries=1 (use max_retries=0 while transporting a held object).",
-    "/control/plan_cartesian_path": "Straight-line (MoveL) move to ABSOLUTE x,y,z in meters. Optional TCP orientation target: roll&pitch&yaw (degrees, base frame, sxyz; straight down = 180,0,0) or qx&qy&qz&qw quaternion -- overrides preserve_orientation. Other params: auto_recover=1, max_retries=1, preserve_orientation=1 (0 = reset to canonical down). WARNING: moves the arm.",
-    "/control/plan_joint_path": "Joint-space plan+execute to x,y,z. Same params as plan_cartesian_path (incl. roll/pitch/yaw or qx..qw orientation target) plus planner_id=LIN|RRTConnectkConfigDefault (use LIN for a minimal in-place reorientation, RRTConnect for large moves). WARNING: moves the arm.",
+    "/control/plan_cartesian_path": "Straight-line (MoveL) move to ABSOLUTE x,y,z in meters. Optional TCP orientation target: roll&pitch&yaw (degrees, base frame, sxyz; straight down = 180,0,0) or qx&qy&qz&qw quaternion -- overrides preserve_orientation. Other params: auto_recover=1, max_retries=1, preserve_orientation=1 (0 = reset to canonical down), max_joint_travel_deg=100 (big-swing guard: plans that wind any joint further are rejected with 409 plan_too_large; 0 disables). WARNING: moves the arm.",
+    "/control/plan_joint_path": "Joint-space plan+execute to x,y,z. Same params as plan_cartesian_path (incl. roll/pitch/yaw or qx..qw orientation target) plus planner_id=LIN|RRTConnectkConfigDefault (use LIN for a minimal in-place reorientation, RRTConnect for large moves; RRTConnect goals are solved by IK seeded from the current joints so the arm keeps its configuration, and the least-travel of 3 plans is used). WARNING: moves the arm.",
     "/simulation/add_box": "Add the fixed demo box to the planning scene.",
     "/simulation/remove_box": "Remove the demo box from the planning scene.",
     "/simulation/attach_box": "Attach the demo box to the gripper (collision-checked as part of the hand).",
@@ -749,6 +750,18 @@ def _parse_motion_args():
     return x, y, z, auto_recover, max_retries, preserve_orientation, orientation
 
 
+def _parse_max_joint_travel():
+    """Optional max_joint_travel_deg override for the big-swing guard.
+    Returns radians, None for the server default, or 0 to disable."""
+    raw = request.args.get("max_joint_travel_deg")
+    if raw is None:
+        return None
+    deg = float(raw)
+    if deg < 0:
+        raise ValueError("max_joint_travel_deg must be >= 0")
+    return math.radians(deg)
+
+
 def _preflight_joint_limit_check():
     """Return (ok, response_tuple). If ok is False, response_tuple is the
     (json_body, status) to return immediately from the handler."""
@@ -804,6 +817,11 @@ def _format_motion_response(outcome, extra=None):
         body["trajectory_violations"] = outcome.get('trajectory_violations', [])
         body["hint"] = "plan would drive a joint near its limit mid-path; try a different target, preserve_orientation=0, or plan_joint_path with planner_id=RRTConnectkConfigDefault"
         return jsonify({**body, "msg": "plan rejected: would drift a joint past safe margin"}), 409
+    if outcome['outcome'] == 'plan_too_large':
+        body["joint_travel_deg"] = {j: round(math.degrees(t), 1) for j, t in outcome.get('joint_travel', {}).items()}
+        body["max_joint_travel_deg"] = round(math.degrees(outcome.get('max_joint_travel_rad', 0.0)), 1)
+        body["hint"] = "plan would swing a joint a long way (elbow flip / base spin); move in smaller steps, or pass max_joint_travel_deg=<bigger> (0 disables) if the big move is intended"
+        return jsonify({**body, "msg": "plan rejected: joint travel too large"}), 409
     if outcome['outcome'] == 'execute_failed':
         body["last_error"] = last_error[-1] if last_error else None
         return jsonify({**body, "msg": "execution failed"}), 500
@@ -818,7 +836,8 @@ def _format_motion_response(outcome, extra=None):
 _last_motion = None
 
 
-def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation, orientation=None):
+def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation, orientation=None,
+                  max_joint_travel=None):
     ok, rejection = _preflight_joint_limit_check()
     if not ok:
         return rejection
@@ -841,6 +860,7 @@ def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation, orie
         auto_recover=auto_recover,
         max_retries=max_retries,
         get_last_error=get_new_error,
+        max_joint_travel_rad=max_joint_travel,
     )
     extra = {"fraction": str(outcome['plan_metadata'].get('fraction'))}
     if outcome['outcome'] == 'plan_failed':
@@ -851,6 +871,7 @@ def _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation, orie
 def plan_cartesian_path():
     try:
         x, y, z, auto_recover, max_retries, preserve_orientation, orientation = _parse_motion_args()
+        max_joint_travel = _parse_max_joint_travel()
     except (TypeError, ValueError) as e:
         return jsonify({"error": "bad motion args", "msg": str(e)}), 400
 
@@ -860,10 +881,11 @@ def plan_cartesian_path():
         'auto_recover': auto_recover, 'max_retries': max_retries,
         'preserve_orientation': preserve_orientation,
         'orientation': orientation,
+        'max_joint_travel': max_joint_travel,
     }
 
     return _do_cartesian(x, y, z, auto_recover, max_retries, preserve_orientation,
-                         orientation=orientation)
+                         orientation=orientation, max_joint_travel=max_joint_travel)
 
 
 @app.route('/control/plan_cartesian_path', methods = ['GET'])
@@ -875,7 +897,7 @@ def plan_cartesian_path_impl():
 
 
 def _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_id="LIN",
-              orientation=None):
+              orientation=None, max_joint_travel=None):
     ok, rejection = _preflight_joint_limit_check()
     if not ok:
         return rejection
@@ -897,6 +919,7 @@ def _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation, planner_
         auto_recover=auto_recover,
         max_retries=max_retries,
         get_last_error=get_new_error,
+        max_joint_travel_rad=max_joint_travel,
     )
     extra = {"planning_time": str(outcome['plan_metadata'].get('planning_time'))}
     if outcome['outcome'] == 'plan_failed':
@@ -908,6 +931,7 @@ def plan_joint_path():
     try:
         x, y, z, auto_recover, max_retries, preserve_orientation, orientation = _parse_motion_args()
         planner_id = request.args.get("planner_id", "LIN")
+        max_joint_travel = _parse_max_joint_travel()
     except (TypeError, ValueError) as e:
         return jsonify({"error": "bad motion args", "msg": str(e)}), 400
 
@@ -918,10 +942,12 @@ def plan_joint_path():
         'preserve_orientation': preserve_orientation,
         'orientation': orientation,
         'planner_id': planner_id,
+        'max_joint_travel': max_joint_travel,
     }
 
     return _do_joint(x, y, z, auto_recover, max_retries, preserve_orientation,
-                     planner_id=planner_id, orientation=orientation)
+                     planner_id=planner_id, orientation=orientation,
+                     max_joint_travel=max_joint_travel)
 
 
 @app.route('/control/plan_joint_path', methods = ['GET'])
@@ -956,12 +982,14 @@ def resume_impl():
         if lm['kind'] == 'cartesian':
             return _do_cartesian(lm['x'], lm['y'], lm['z'],
                                  lm['auto_recover'], lm['max_retries'], lm['preserve_orientation'],
-                                 orientation=lm.get('orientation'))
+                                 orientation=lm.get('orientation'),
+                                 max_joint_travel=lm.get('max_joint_travel'))
         if lm['kind'] == 'joint':
             return _do_joint(lm['x'], lm['y'], lm['z'],
                              lm['auto_recover'], lm['max_retries'], lm['preserve_orientation'],
                              orientation=lm.get('orientation'),
-                             planner_id=lm.get('planner_id', 'LIN'))
+                             planner_id=lm.get('planner_id', 'LIN'),
+                             max_joint_travel=lm.get('max_joint_travel'))
         return jsonify({"error": f"unknown cached motion kind: {lm.get('kind')}"}), 500
     finally:
         moveit_lock.release()

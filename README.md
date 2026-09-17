@@ -264,6 +264,14 @@ Some parts of this codebase are known-limited or known-broken. Expect follow-up 
   Adjust in `add_virtual_walls()` / `VIRTUAL_CEILING_Z` (franka.py). If the arm is
   already inside the slab when the server starts (e.g. after bumping the ceiling),
   planning from that start state fails — hand-guide it down first.
+- **Big-swing guard** (2026-09-17): every motion endpoint rejects a plan whose
+  cumulative travel on any joint exceeds `max_joint_travel_deg` (default 100°,
+  `MAX_JOINT_TRAVEL_RAD` in franka.py) with `409 plan_too_large` and the per-joint
+  travel, instead of letting a sampling planner spin the base / flip the elbow.
+  Pass a bigger value (or `0` to disable) when a large move is intended. Joint-space
+  goals for the OMPL planners are solved by IK seeded from the current joints (plus
+  "natural" seeds aimed at the target) and the closest configuration is used; the
+  least-travel of 3 plans is executed.
 - The API must run in a shell with ROS sourced (`source /opt/ros/noetic/setup.bash` + your workspace).
 - Motion endpoints serialize via a non-blocking lock — concurrent motion requests get 409 "Robot is busy" rather than queuing.
 - Motions apply an orientation path constraint (±0.5 rad) to prevent mid-path IK flips. Constraint is suppressed when `preserve_orientation=0` (so the wrist is allowed to freely reorient to the new target).

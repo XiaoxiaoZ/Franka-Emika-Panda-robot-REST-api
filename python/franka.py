@@ -174,6 +174,28 @@ def check_trajectory_for_limits(plan, margin_rad=0.02):
     return violations
 
 
+def trajectory_joint_travel(plan):
+    """Cumulative absolute travel of each joint over a RobotTrajectory, in
+    radians: {joint_name: sum(|q[i+1]-q[i]|)}. Cumulative (not max-min) so a
+    joint that swings out and back is counted. Empty dict if plan is empty."""
+    travel = {}
+    traj = getattr(plan, "joint_trajectory", None) if plan is not None else None
+    if traj is None:
+        return travel
+    names = list(getattr(traj, "joint_names", []))
+    points = getattr(traj, "points", [])
+    prev = None
+    for point in points:
+        pos = getattr(point, "positions", None)
+        if not pos:
+            continue
+        if prev is not None:
+            for name, a, b in zip(names, prev, pos):
+                travel[name] = travel.get(name, 0.0) + abs(b - a)
+        prev = pos
+    return travel
+
+
 def is_user_stop_abort(error_text):
     """Detect Panda hardware user-stop button activation. libfranka emits
     `Move command aborted: User Stop pressed!` when the physical safety
@@ -662,7 +684,16 @@ class MoveGroupPythonInterfaceTutorial(object):
             move_group.set_max_acceleration_scaling_factor(1.0)
         return result
 
-    def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1, get_last_error=None, traj_check_margin_rad=0.02):
+    # Largest cumulative travel (rad) any single joint may make in one motion.
+    # A pose goal has many IK solutions and a sampling planner happily picks
+    # a far-away one (elbow flip, base spun 130 deg), which the user does not
+    # want near people. 1.75 rad ~ 100 deg: moves between the working poses
+    # use far less, and even home -> table pick needs only ~90 deg on the
+    # shoulder; a rejected plan tells the caller to go in steps.
+    MAX_JOINT_TRAVEL_RAD = 1.75
+
+    def plan_and_execute_with_retry(self, plan_fn, auto_recover=True, max_retries=1, get_last_error=None,
+                                    traj_check_margin_rad=0.02, max_joint_travel_rad=None):
         """Plan, execute, and auto-recover on execute failure.
 
         plan_fn: callable returning (plan, plan_ok, metadata)
@@ -682,9 +713,13 @@ class MoveGroupPythonInterfaceTutorial(object):
         Plan failures (plan_ok=False) are not retried — recover can't help a
         target that's unreachable / in collision / etc.
 
+        max_joint_travel_rad: reject plans whose cumulative per-joint travel
+          exceeds this (None -> MAX_JOINT_TRAVEL_RAD; 0 disables the check).
+
         Returns dict:
           outcome: 'success' | 'plan_failed' | 'execute_failed' |
-                   'recovery_failed' | 'stopped' | 'stopped_external_force'
+                   'recovery_failed' | 'stopped' | 'stopped_external_force' |
+                   'plan_would_violate_limits' | 'plan_too_large'
           recovery_triggered: bool
           recovery_succeeded: bool
           attempts: int
@@ -695,6 +730,8 @@ class MoveGroupPythonInterfaceTutorial(object):
         recovery_succeeded = False
         attempts = 0
         last_meta = {}
+        if max_joint_travel_rad is None:
+            max_joint_travel_rad = self.MAX_JOINT_TRAVEL_RAD
         # Clear any stop flag from a previous motion so this call starts clean.
         self._stop_requested = False
 
@@ -739,6 +776,23 @@ class MoveGroupPythonInterfaceTutorial(object):
                         'attempts': attempts,
                         'plan_metadata': last_meta,
                         'trajectory_violations': traj_violations,
+                    }
+
+            # Big-swing guard: refuse trajectories that wind a joint a long
+            # way even though start and goal poses may be close.
+            if max_joint_travel_rad:
+                travel = trajectory_joint_travel(plan)
+                too_far = {j: round(t, 3) for j, t in travel.items() if t > max_joint_travel_rad}
+                if too_far:
+                    rospy.logwarn("plan rejected: joint travel %s exceeds %.2f rad", too_far, max_joint_travel_rad)
+                    return {
+                        'outcome': 'plan_too_large',
+                        'recovery_triggered': recovery_triggered,
+                        'recovery_succeeded': recovery_succeeded,
+                        'attempts': attempts,
+                        'plan_metadata': last_meta,
+                        'joint_travel': {j: round(t, 3) for j, t in travel.items()},
+                        'max_joint_travel_rad': max_joint_travel_rad,
                     }
 
             ok = self.execute_plan(plan)
@@ -815,6 +869,73 @@ class MoveGroupPythonInterfaceTutorial(object):
             'attempts': attempts,
             'plan_metadata': last_meta,
         }
+
+    # Weights for picking among IK solutions: swinging the whole arm round
+    # (joint 1) or flipping the elbow (joint 3) is what reads as a "big
+    # motion" to bystanders; wrist roll (7) barely matters.
+    IK_JOINT_WEIGHTS = (2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 0.5)
+
+    def _ik_near_current(self, pose, timeout=0.2):
+        """Joint values reaching ``pose`` (base frame) that stay closest to
+        the current configuration. /compute_ik (collision-aware) is run from
+        several seeds -- the current joints, plus "natural" configurations
+        with the base joint pointed at the target and the redundant joints
+        (3, 5) zeroed, since seeding from the current state alone still
+        happily returns a base-spun elbow-swung solution -- and the solution
+        with the smallest max joint delta from the current joints wins.
+        Returns a 7-list or None if every seed fails."""
+        import math as _math
+        from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
+        move_group = self.move_group
+        try:
+            rospy.wait_for_service("/compute_ik", timeout=2.0)
+            ik = rospy.ServiceProxy("/compute_ik", GetPositionIK)
+            names = move_group.get_active_joints()
+            cur_state = self.robot.get_current_state()
+            cur_lookup = dict(zip(cur_state.joint_state.name, cur_state.joint_state.position))
+            current = [cur_lookup[n] for n in names]
+
+            j1_target = _math.atan2(pose.position.y, pose.position.x)
+            seeds = [current]
+            natural = list(current)
+            natural[0], natural[2], natural[4] = j1_target, 0.0, 0.0
+            seeds.append(natural)
+            # canonical elbow-up "ready" arm aimed at the target
+            seeds.append([j1_target, -0.785, 0.0, -1.571, 0.0, 1.047, 0.785])
+            # same, wrist rotated the other way round (yaw ambiguity)
+            seeds.append([j1_target, -0.785, 0.0, -1.571, 0.0, 1.047, 0.785 - _math.pi])
+
+            best, best_cost = None, float("inf")
+            for seed in seeds:
+                req = GetPositionIKRequest()
+                req.ik_request.group_name = move_group.get_name()
+                st = copy.deepcopy(cur_state)
+                pos = list(st.joint_state.position)
+                for n, v in zip(names, seed):
+                    pos[list(st.joint_state.name).index(n)] = v
+                st.joint_state.position = pos
+                req.ik_request.robot_state = st
+                req.ik_request.ik_link_name = move_group.get_end_effector_link()
+                req.ik_request.pose_stamped.header.frame_id = move_group.get_planning_frame()
+                req.ik_request.pose_stamped.pose = pose
+                req.ik_request.avoid_collisions = True
+                req.ik_request.timeout = rospy.Duration(timeout)
+                res = ik(req)
+                if res.error_code.val != MoveItErrorCodes.SUCCESS:
+                    continue
+                lookup = dict(zip(res.solution.joint_state.name, res.solution.joint_state.position))
+                sol = [lookup[n] for n in names]
+                cost = max(w * abs(a - b) for w, a, b in zip(self.IK_JOINT_WEIGHTS, sol, current))
+                if cost < best_cost:
+                    best, best_cost = sol, cost
+            if best is None:
+                rospy.logwarn("seeded IK failed from every seed; falling back to pose goal")
+                return None
+            rospy.loginfo("seeded IK: max joint delta %.2f rad", best_cost)
+            return best
+        except Exception as e:
+            rospy.logwarn("seeded IK unavailable (%s); falling back to pose goal", e)
+            return None
 
     def _eef_orientation_constraint(self, qx=1.0, qy=0.0, qz=0.0, qw=0.0, tolerance=0.8):
         # Keep the end-effector aligned with the given target orientation
@@ -912,7 +1033,19 @@ class MoveGroupPythonInterfaceTutorial(object):
             wpose.orientation.y = 0.0
             wpose.orientation.z = 0.0
             wpose.orientation.w = 0.0
-        move_group.set_pose_target(wpose)
+        # A pose goal lets the sampling planner pick ANY IK solution, and the
+        # far ones (elbow flipped, base spun round) produce the big swings the
+        # user does not want. So for the sampling planners, first solve IK
+        # seeded from the current joints (KDL converges to the nearby
+        # solution) and plan to that joint goal instead; fall back to the pose
+        # goal only if seeded IK fails. Pilz LIN is a straight line anyway.
+        joint_goal = None
+        if planner_id != "LIN":
+            joint_goal = self._ik_near_current(wpose)
+        if joint_goal is not None:
+            move_group.set_joint_value_target(joint_goal)
+        else:
+            move_group.set_pose_target(wpose)
         move_group.set_num_planning_attempts(10)
         move_group.set_planning_time(5.0)
         # Apply orientation constraint only when preserving orientation -- see
@@ -923,10 +1056,24 @@ class MoveGroupPythonInterfaceTutorial(object):
                 wpose.orientation.z, wpose.orientation.w,
             ))
         try:
-            (plan_success, plan, planning_time, error_code) = move_group.plan()
+            # Sampling planners are stochastic: plan a few times and keep the
+            # trajectory with the least joint travel.
+            n_plans = 1 if planner_id == "LIN" else 3
+            best = None
+            for _ in range(n_plans):
+                (plan_success, plan, planning_time, error_code) = move_group.plan()
+                if not plan_success:
+                    if best is None:
+                        best = (plan_success, plan, planning_time, error_code, float("inf"))
+                    continue
+                cost = max(trajectory_joint_travel(plan).values() or [0.0])
+                if best is None or cost < best[4]:
+                    best = (plan_success, plan, planning_time, error_code, cost)
+            (plan_success, plan, planning_time, error_code, _cost) = best
         finally:
             move_group.clear_path_constraints()
-        print(plan_success, planning_time, error_code)
+            move_group.clear_pose_targets()
+        print(plan_success, planning_time, error_code, "joint_goal_seeded=%s" % (joint_goal is not None))
         #set speed
         velocity_scaling_factor = 0.30
         plan = move_group.retime_trajectory(moveit_commander.RobotCommander().get_current_state(), 
