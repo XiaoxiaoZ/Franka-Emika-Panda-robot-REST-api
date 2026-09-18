@@ -10,7 +10,9 @@ from threading import Lock
 # Log
 from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits, is_user_stop_abort
 from force_viz import ForceVisualizer
-from files_api import bp as files_bp
+from files_api import bp as files_bp, store as file_store
+import scene_api
+from scene_manager import SceneManager
 from payload_id import PayloadIdentifier
 from realsense_cam import RealsenseCamera
 import rospy
@@ -37,6 +39,9 @@ rospy.Subscriber("/rosout", Log, rosout_cd)
 app = Flask(__name__)
 # /files: sandboxed HTTP file store (CAD models pushed by the detector etc.)
 app.register_blueprint(files_bp)
+# /scene: CAD models + objects in the planning scene (wired up after the
+# robot interface exists, below).
+app.register_blueprint(scene_api.bp)
 
 # Flask debug mode (and its auto-reloader). The reloader re-executes this
 # module in a child process, so module-level singletons are built twice unless
@@ -68,6 +73,18 @@ robot.add_floor()
 # Safety walls: fence the arm into the working quadrant (people stand in the
 # other regions). See MoveGroupPythonInterfaceTutorial.add_virtual_walls.
 robot.add_virtual_walls()
+
+# CAD models / detected objects in the planning scene. State lives next to
+# the /files store and is re-applied here because move_group forgets its
+# world on restart.
+scene_manager = SceneManager(robot.scene, file_store,
+                             os.path.join(file_store.root, "scene.json"),
+                             planning_frame=robot.move_group.get_planning_frame(),
+                             logger=rospy.logwarn)
+scene_api.init(scene_manager, moveit_lock)
+_restored = scene_manager.restore()
+rospy.loginfo("scene restored: %d models, %d objects%s", _restored["models"], _restored["objects"],
+              (" -- errors: %s" % _restored["errors"]) if _restored["errors"] else "")
 
 # End-effector force visualization: subscribes to /franka_state_controller/F_ext
 # and publishes an arrow+label MarkerArray to /franka_ee_force for RViz.
@@ -146,6 +163,7 @@ def api_help():
             "GET /control/gripper_grasp?force=20 to grasp; /control/gripper_open_force to open.",
             "GET /control/stop to stop motion; GET /recover to clear reflex errors.",
             "PUT /files/cad/part.stl (raw body) to store a CAD model on the server; GET /files?q=*.stl to find it.",
+            "POST /scene/models {name, file, scale} to register it; POST /scene/objects {name, model, x,y,z, yaw} to place it; PUT /scene/objects/sync {source, objects:[...]} from a detector.",
         ],
         "conventions": {
             "units": "meters, Newtons, N*m, radians; positions are absolute in the robot base frame",

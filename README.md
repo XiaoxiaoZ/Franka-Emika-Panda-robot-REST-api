@@ -274,6 +274,41 @@ Paths are restricted to `[A-Za-z0-9][A-Za-z0-9._-]*` components under the root
 so readers never see a partial file; `overwrite=0` refuses to replace. The web UI
 (`/ui`) has a Files panel for browsing/upload/delete.
 
+## CAD models in the planning scene (`/scene`)
+
+Two layers: **models** (a mesh file from `/files`, parsed once) and **objects**
+(instances of a model at a pose). Anything placed here is collision-checked by
+MoveIt like the walls and ceiling, and shows up in RViz. State is persisted to
+`data/scene.json` and re-applied at server start.
+
+```
+# register a model (STL exported in mm -> scale 0.001; convex_hull for heavy CAD)
+curl -X POST -H 'Content-Type: application/json' http://172.26.0.212:5000/scene/models \
+     -d '{"name":"bracket","file":"cad/bracket.stl","scale":0.001,"collision":"convex_hull"}'
+# place it (pose in panda_link0; roll/pitch/yaw in degrees or qx..qw)
+curl -X POST -H 'Content-Type: application/json' http://172.26.0.212:5000/scene/objects \
+     -d '{"name":"bracket_1","model":"bracket","x":0.55,"y":-0.2,"z":0.02,"yaw":30}'
+# detector: replace its whole set after every run (idempotent)
+curl -X PUT -H 'Content-Type: application/json' http://172.26.0.212:5000/scene/objects/sync \
+     -d '{"source":"detector","objects":[{"name":"det_1","model":"bracket","x":0.5,"y":-0.2,"z":0.02,"yaw":12}]}'
+curl http://172.26.0.212:5000/scene/objects                  # everything, incl. built-ins
+curl -X PATCH -H 'Content-Type: application/json' http://172.26.0.212:5000/scene/objects/bracket_1 -d '{"x":0.6}'
+curl -X POST http://172.26.0.212:5000/scene/objects/bracket_1/attach    # carried by the gripper
+curl -X POST http://172.26.0.212:5000/scene/objects/bracket_1/detach
+curl -X DELETE http://172.26.0.212:5000/scene/objects/bracket_1
+```
+
+- Formats: STL / OBJ / DAE / PLY (all meshes in the file are merged with their
+  node transforms). STEP/IGES are refused (415) — export to STL first.
+- `sync` only touches objects tagged with its `source`; manual objects, built-in
+  safety geometry and objects currently attached to the gripper are left alone.
+  Unknown models come back as `404 unknown_model` with the list to register.
+- Built-ins (`floor`, `virtual_wall_*`, `virtual_ceiling`) need `force=1` to delete.
+- Scene mutations wait up to 5 s for the motion lock (409 `busy` otherwise) so the
+  world never changes under a running plan.
+- Detailed CAD makes collision checking slow; prefer `collision=convex_hull` or
+  a decimated mesh (triangle counts are reported on registration).
+
 ## Notes
 
 - **Virtual safety walls + ceiling**: at startup two transparent red walls are added
