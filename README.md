@@ -253,6 +253,27 @@ Some parts of this codebase are known-limited or known-broken. Expect follow-up 
 - **Gripper auto-recovery** — implemented as a generic retry wrapper (`_gripper_action_call`). On failure or timeout, optionally calls `/franka_control/error_recovery` and retries the action. Default is one retry. **Context-awareness is the caller's responsibility:** for transit scenarios (gripper already holding an object mid-transport), pass `max_retries=0` to avoid a reset-and-retry that could disturb the grasp.
 - **Simulation / scene API — basic.** `/simulation/add_box` hardcodes a single fixed-size cube; `self.box_name` is a single slot that `add_floor()` overwrites, which can cause `/simulation/remove_box` to remove the wrong object. No shape/size/pose parameters. Scene mutations don't take the motion lock. Needs a dedicated redesign pass.
 
+## File store (`/files`)
+
+A sandboxed HTTP file store on the same server, so other machines (the object
+detector, a laptop) can push CAD models that `/scene/models` will reference by
+path. Root is `data/` (env `FRANKA_FILES_ROOT`), per-file limit 100 MB
+(`FRANKA_FILES_MAX_BYTES`), quota 2 GB (`FRANKA_FILES_QUOTA_BYTES`).
+
+```
+curl -T part.stl http://172.26.0.212:5000/files/cad/part.stl      # upload (PUT raw body)
+curl http://172.26.0.212:5000/files/cad                           # list a directory (JSON)
+curl "http://172.26.0.212:5000/files?q=*.stl"                     # recursive glob search
+curl -O http://172.26.0.212:5000/files/cad/part.stl               # download (ETag = sha256)
+curl -X DELETE http://172.26.0.212:5000/files/cad/part.stl
+curl -X POST "http://172.26.0.212:5000/files/cad?mkdir=1"
+```
+
+Paths are restricted to `[A-Za-z0-9][A-Za-z0-9._-]*` components under the root
+(no `..`, no dotfiles); uploads are written to a temp file and renamed into place
+so readers never see a partial file; `overwrite=0` refuses to replace. The web UI
+(`/ui`) has a Files panel for browsing/upload/delete.
+
 ## Notes
 
 - **Virtual safety walls + ceiling**: at startup two transparent red walls are added

@@ -131,6 +131,17 @@
     </div>
   </section>
 
+  <section class="card">
+    <h2>Files</h2>
+    <div class="row">
+      <input id="fdir" value="" placeholder="directory (blank = root)" style="width:12em">
+      <button class="ghost" onclick="listFiles()">List</button>
+      <input type="file" id="fpick" style="max-width:14em">
+      <button onclick="uploadFile()">Upload</button>
+    </div>
+    <ul id="files"><li style="color:var(--mut)">press List</li></ul>
+  </section>
+
   <section class="card" id="log">
     <h2>Log</h2>
     <div id="logbox"></div>
@@ -156,21 +167,21 @@ function log(msg, cls) {
   box.scrollTop = box.scrollHeight;
 }
 
-async function api(path, timeoutMs = 60000) {
+async function api(path, timeoutMs = 60000, method = 'GET') {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch(path, { signal: ctl.signal });
+    const r = await fetch(path, { signal: ctl.signal, method });
     const text = await r.text();
     let body; try { body = JSON.parse(text); } catch { body = { raw: text }; }
     return { status: r.status, body };
   } finally { clearTimeout(timer); }
 }
 
-async function callApi(path, label, timeoutMs) {
-  log(`GET ${path}`);
+async function callApi(path, label, timeoutMs, method = 'GET') {
+  log(`${method} ${path}`);
   try {
-    const { status, body } = await api(path, timeoutMs);
+    const { status, body } = await api(path, timeoutMs, method);
     const brief = JSON.stringify(body);
     log(`${label}: HTTP ${status} ${brief.length > 220 ? brief.slice(0, 220) + '…' : brief}`,
         status >= 400 ? 'err' : 'okl');
@@ -345,6 +356,53 @@ async function refreshState(logIt) {
 setInterval(refreshState, 1000);
 refreshState();
 log('Franka web GUI ready. All commands go to this server (' + location.host + ').', 'okl');
+
+// ---- /files panel ----
+function fileDir() { return $('fdir').value.trim().replace(/^\/+|\/+$/g, ''); }
+async function listFiles() {
+  const dir = fileDir();
+  const r = await callApi(dir ? `/files/${dir}` : '/files', 'list files', 15000);
+  const ul = $('files'); ul.innerHTML = '';
+  if (r.status !== 200 || !r.body || !r.body.entries) return;
+  if (dir) {
+    const up = document.createElement('li');
+    up.innerHTML = '<a href="#">..</a>';
+    up.firstChild.onclick = e => { e.preventDefault(); $('fdir').value = dir.split('/').slice(0, -1).join('/'); listFiles(); };
+    ul.appendChild(up);
+  }
+  if (!r.body.entries.length) { ul.innerHTML += '<li style="color:var(--mut)">empty</li>'; }
+  for (const e of r.body.entries) {
+    const li = document.createElement('li');
+    if (e.type === 'dir') {
+      li.innerHTML = `<a href="#">${e.name}/</a>`;
+      li.firstChild.onclick = ev => { ev.preventDefault(); $('fdir').value = e.path; listFiles(); };
+    } else {
+      const kb = (e.size / 1024).toFixed(1);
+      li.innerHTML = `<a href="/files/${e.path}">${e.name}</a> <span style="color:var(--mut)">${kb} KB · ${e.mtime}</span> `;
+      const del = document.createElement('button'); del.className = 'ghost'; del.textContent = 'delete';
+      del.onclick = async () => {
+        if (!confirm(`Delete ${e.path}?`)) return;
+        await callApi(`/files/${e.path}`, `delete ${e.name}`, 15000, 'DELETE');
+        listFiles();
+      };
+      li.appendChild(del);
+    }
+    ul.appendChild(li);
+  }
+}
+async function uploadFile() {
+  const f = $('fpick').files[0];
+  if (!f) { log('choose a file first', 'err'); return; }
+  const dir = fileDir();
+  const path = `/files/${dir ? dir + '/' : ''}${f.name}`;
+  log(`PUT ${path} (${(f.size / 1024).toFixed(1)} KB)`);
+  try {
+    const r = await fetch(path, { method: 'PUT', body: f });
+    const body = await r.json();
+    log(`upload ${f.name}: HTTP ${r.status} ${JSON.stringify(body).slice(0, 160)}`, r.status >= 400 ? 'err' : 'okl');
+  } catch (e) { log(`upload ${f.name}: ${e}`, 'err'); }
+  listFiles();
+}
 </script>
 </body>
 </html>

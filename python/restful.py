@@ -10,6 +10,7 @@ from threading import Lock
 # Log
 from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits, is_user_stop_abort
 from force_viz import ForceVisualizer
+from files_api import bp as files_bp
 from payload_id import PayloadIdentifier
 from realsense_cam import RealsenseCamera
 import rospy
@@ -34,6 +35,8 @@ rospy.Subscriber("/rosout", Log, rosout_cd)
 
 # creating a Flask app
 app = Flask(__name__)
+# /files: sandboxed HTTP file store (CAD models pushed by the detector etc.)
+app.register_blueprint(files_bp)
 
 # Flask debug mode (and its auto-reloader). The reloader re-executes this
 # module in a child process, so module-level singletons are built twice unless
@@ -130,7 +133,7 @@ def api_help():
         doc = inspect.getdoc(view) if view else None
         endpoints.append({
             "path": rule.rule,
-            "methods": sorted(m for m in rule.methods if m in ("GET", "POST")),
+            "methods": sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS")),
             "description": doc or _HELP_NOTES.get(rule.rule, ""),
         })
     endpoints.sort(key=lambda e: e["path"])
@@ -142,6 +145,7 @@ def api_help():
             "GET /control/plan_cartesian_path?x=&y=&z= to move (meters, absolute; MOVES THE ARM).",
             "GET /control/gripper_grasp?force=20 to grasp; /control/gripper_open_force to open.",
             "GET /control/stop to stop motion; GET /recover to clear reflex errors.",
+            "PUT /files/cad/part.stl (raw body) to store a CAD model on the server; GET /files?q=*.stl to find it.",
         ],
         "conventions": {
             "units": "meters, Newtons, N*m, radians; positions are absolute in the robot base frame",
