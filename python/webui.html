@@ -52,6 +52,19 @@
                 font-size:14px; }
   #objects li:last-child { border-bottom:none; }
   #objects li.sel { background:#e3ecfa; }
+  #jtable { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
+  #jtable th { text-align:left; color:var(--mut); font-weight:600; padding:3px 6px; white-space:nowrap;
+               border-bottom:1px solid var(--line); }
+  #jtable td { padding:4px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  #jtable tr:last-child td { border-bottom:none; }
+  #jtable td.num { text-align:right; }
+  .jbar { position:relative; width:100%; min-width:70px; height:8px; background:#eef2f6;
+          border-radius:4px; }
+  .jbar i { position:absolute; top:-2px; width:3px; height:12px; margin-left:-1px;
+            border-radius:1px; background:var(--blue); }
+  #jtable tr.warn td { background:#fff6e5; } #jtable tr.warn .jbar i { background:var(--amber); }
+  #jtable tr.crit td { background:#fdecec; } #jtable tr.crit .jbar i { background:var(--red); }
+  #jtable tr.crit td.lim { color:var(--red); font-weight:700; }
   #cam { grid-column:1 / -1; }
   #camwrap { position:relative; background:#10161d; border-radius:8px; overflow:hidden;
              min-height:180px; display:flex; align-items:center; justify-content:center; }
@@ -80,6 +93,18 @@
 </header>
 
 <main>
+  <section class="card" id="jointscard">
+    <h2>Joints</h2>
+    <table id="jtable">
+      <thead><tr><th></th><th style="text-align:right">deg</th><th>range</th>
+        <th style="text-align:right">Nm</th><th style="text-align:right" title="distance to nearest limit (deg)">margin</th></tr></thead>
+      <tbody id="jbody"><tr><td colspan="5" style="color:var(--mut)">waiting for /joints…</td></tr></tbody>
+    </table>
+    <div class="row" style="margin-top:8px">
+      <button class="ghost" onclick="copyJoints()">Copy rad</button>
+      <span id="jinfo" style="font-size:13px;color:var(--mut)"></span>
+    </div>
+  </section>
   <section class="card">
     <h2>Presets</h2>
     <div class="row">
@@ -360,13 +385,49 @@ async function moveNext() {
   if (await moveToObject(i, `move to #${i + 1}`)) nextIdx = (i + 1) % objects.length;
 }
 
+// ---- joints ----
+// Amber under 5 deg from a limit, red under the 0.02 rad (~1.1 deg) margin at
+// which the motion endpoints refuse with joint_near_limit.
+const J_WARN_DEG = 5, J_CRIT_DEG = 0.02 * 180 / Math.PI;
+let lastJoints = null;
+function renderJoints(d) {
+  const body = $('jbody');
+  if (!d || !d.joints) {
+    lastJoints = null;
+    body.innerHTML = '<tr><td colspan="5" style="color:var(--mut)">joints unavailable</td></tr>';
+    $('jinfo').textContent = '';
+    return;
+  }
+  lastJoints = d.positions;
+  body.innerHTML = d.joints.map(j => {
+    const frac = (j.position_rad - j.limit_lo_rad) / (j.limit_hi_rad - j.limit_lo_rad);
+    const cls = j.to_limit_deg < J_CRIT_DEG ? 'crit' : (j.to_limit_deg < J_WARN_DEG ? 'warn' : '');
+    const tau = j.effort_nm == null ? '–' : j.effort_nm.toFixed(2);
+    return `<tr class="${cls}"><td>J${j.index}</td>` +
+      `<td class="num">${j.position_deg.toFixed(1)}</td>` +
+      `<td title="${(j.limit_lo_rad * 180 / Math.PI).toFixed(0)}° … ${(j.limit_hi_rad * 180 / Math.PI).toFixed(0)}°">` +
+      `<div class="jbar"><i style="left:${(Math.max(0, Math.min(1, frac)) * 100).toFixed(1)}%"></i></div></td>` +
+      `<td class="num">${tau}</td><td class="num lim">${j.to_limit_deg.toFixed(1)}</td></tr>`;
+  }).join('');
+  const w = d.gripper_width_m == null ? '' : ` · gripper ${(d.gripper_width_m * 1000).toFixed(1)} mm`;
+  const near = d.near_limit && d.near_limit.length ? ` · AT LIMIT: ${d.near_limit.join(', ')}` : '';
+  $('jinfo').textContent = `age ${d.age_s.toFixed(2)} s${w}${near}`;
+}
+async function copyJoints() {
+  if (!lastJoints) { log('no joint values yet', 'err'); return; }
+  const text = '[' + lastJoints.map(v => v.toFixed(5)).join(', ') + ']';
+  try { await navigator.clipboard.writeText(text); log(`copied joints (rad): ${text}`, 'okl'); }
+  catch { log(`joints (rad): ${text}`, 'okl'); }   // clipboard needs https/localhost
+}
+
 // ---- live status (state and force handled independently; no overlap) ----
 let pollBusy = false;
 async function refreshState(logIt) {
   if (pollBusy && !logIt) return;   // skip the tick if the last poll is slow
   pollBusy = true;
   try {
-    const [st, fo] = await Promise.allSettled([api('/state', 4000), api('/force', 4000)]);
+    const [st, fo, jo] = await Promise.allSettled([api('/state', 4000), api('/force', 4000), api('/joints', 4000)]);
+    renderJoints(jo.status === 'fulfilled' && jo.value.status === 200 ? jo.value.body : null);
     if (st.status === 'fulfilled' && st.value.status === 200) {
       const p = st.value.body.position;
       $('sx').textContent = p.x.toFixed(3);
