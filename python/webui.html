@@ -37,6 +37,9 @@
   .row:last-child { margin-bottom:0; }
   input { width:80px; padding:8px; border:1px solid var(--line); border-radius:7px;
           font-size:14px; }
+  input[type=radio], input[type=checkbox] { width:auto; padding:0; margin:0 4px 0 0;
+                                            vertical-align:middle; }
+  input[type=file] { width:auto; max-width:16em; padding:5px; }
   label { font-size:13px; color:var(--mut); }
   #jog { display:grid; grid-template-columns:repeat(4,64px); grid-auto-rows:52px;
          gap:6px; justify-content:start; }
@@ -47,6 +50,14 @@
                 font-size:14px; }
   #objects li:last-child { border-bottom:none; }
   #objects li.sel { background:#e3ecfa; }
+  #cam { grid-column:1 / -1; }
+  #camwrap { position:relative; background:#10161d; border-radius:8px; overflow:hidden;
+             min-height:180px; display:flex; align-items:center; justify-content:center; }
+  #camimg { display:block; width:100%; height:auto; max-height:60vh; object-fit:contain; }
+  #camoff { color:var(--mut); font-size:13px; padding:40px 12px; text-align:center; }
+  #camdot { width:9px; height:9px; border-radius:50%; background:#bbb; display:inline-block; }
+  #camdot.live { background:var(--red); animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
   #log { grid-column:1 / -1; }
   #logbox { font:12px/1.5 ui-monospace,Menlo,Consolas,monospace; background:#10161d;
             color:#cfe3d8; border-radius:8px; padding:10px; height:180px;
@@ -131,12 +142,29 @@
     </div>
   </section>
 
+  <section class="card" id="cam">
+    <h2>Camera</h2>
+    <div class="row">
+      <button id="camtoggle" class="good" onclick="toggleCamera()">Turn camera on</button>
+      <label><input type="radio" name="camview" value="color" checked onchange="restartStream()"> color</label>
+      <label><input type="radio" name="camview" value="depth" onchange="restartStream()"> depth</label>
+      <label>fps</label><input id="camfps" type="number" min="1" max="30" step="1" value="10"
+             style="width:60px" onchange="restartStream()">
+      <button class="ghost" onclick="window.open('/camera/color?format=png', '_blank')">Snapshot (PNG)</button>
+      <span id="camdot"></span><span id="caminfo" style="font-size:13px;color:var(--mut)">off</span>
+    </div>
+    <div id="camwrap">
+      <img id="camimg" alt="camera stream" style="display:none">
+      <div id="camoff">camera is off — press “Turn camera on”</div>
+    </div>
+  </section>
+
   <section class="card">
     <h2>Files</h2>
     <div class="row">
       <input id="fdir" value="" placeholder="directory (blank = root)" style="width:12em">
       <button class="ghost" onclick="listFiles()">List</button>
-      <input type="file" id="fpick" style="max-width:14em">
+      <input type="file" id="fpick">
       <button onclick="uploadFile()">Upload</button>
     </div>
     <ul id="files"><li style="color:var(--mut)">press List</li></ul>
@@ -356,6 +384,60 @@ async function refreshState(logIt) {
 setInterval(refreshState, 1000);
 refreshState();
 log('Franka web GUI ready. All commands go to this server (' + location.host + ').', 'okl');
+
+// ---- camera ----
+// camOn tracks what the user asked for; the <img> MJPEG connection is torn
+// down by clearing src (the browser keeps streaming otherwise, holding a
+// server thread and the USB device).
+let camOn = false;
+function camView() { return document.querySelector('input[name=camview]:checked').value; }
+function streamUrl() {
+  const fps = Math.max(1, Math.min(30, parseInt($('camfps').value) || 10));
+  return `/camera/stream?view=${camView()}&fps=${fps}&t=${Date.now()}`;
+}
+function stopStream() {
+  const img = $('camimg');
+  img.removeAttribute('src');   // closes the MJPEG connection
+  img.style.display = 'none';
+  $('camoff').style.display = '';
+  $('camdot').classList.remove('live');
+}
+function startStream() {
+  const img = $('camimg');
+  img.onerror = () => { if (camOn) { log('camera stream dropped', 'err'); $('caminfo').textContent = 'stream error'; $('camdot').classList.remove('live'); } };
+  img.onload = () => { $('camdot').classList.add('live'); };
+  img.src = streamUrl();
+  img.style.display = '';
+  $('camoff').style.display = 'none';
+}
+function restartStream() { if (camOn) { stopStream(); startStream(); } }
+async function toggleCamera() {
+  const btn = $('camtoggle');
+  btn.disabled = true;
+  try {
+    if (!camOn) {
+      const r = await callApi('/camera/start', 'camera start', 20000);
+      if (r.status !== 200) { $('caminfo').textContent = (r.body && r.body.msg) || 'camera unavailable'; return; }
+      camOn = true;
+      btn.textContent = 'Turn camera off'; btn.className = 'warn';
+      const i = r.body || {};
+      $('caminfo').textContent = `${i.width}x${i.height} @ ${i.fps} fps${i.serial ? ' · ' + i.serial : ''}`;
+      startStream();
+    } else {
+      camOn = false;
+      stopStream();                     // release the stream BEFORE stopping the device
+      btn.textContent = 'Turn camera on'; btn.className = 'good';
+      $('caminfo').textContent = 'off';
+      await callApi('/camera/stop', 'camera stop', 20000);
+    }
+  } finally { btn.disabled = false; }
+}
+// Don't leave a stream (and the USB device) held open by a hidden tab.
+document.addEventListener('visibilitychange', () => {
+  if (!camOn) return;
+  if (document.hidden) stopStream(); else startStream();
+});
+window.addEventListener('pagehide', () => { if (camOn) stopStream(); });
 
 // ---- /files panel ----
 function fileDir() { return $('fdir').value.trim().replace(/^\/+|\/+$/g, ''); }

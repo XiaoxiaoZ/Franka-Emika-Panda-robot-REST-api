@@ -162,6 +162,7 @@ def api_help():
             "GET /control/plan_cartesian_path?x=&y=&z= to move (meters, absolute; MOVES THE ARM).",
             "GET /control/gripper_grasp?force=20 to grasp; /control/gripper_open_force to open.",
             "GET /control/stop to stop motion; GET /recover to clear reflex errors.",
+            "GET /camera/stream (MJPEG, browser-viewable) for a live view; /camera/color for a still; /camera/start and /camera/stop control the device.",
             "PUT /files/cad/part.stl (raw body) to store a CAD model on the server; GET /files?q=*.stl to find it.",
             "POST /scene/models {name, file, scale} to register it; POST /scene/objects {name, model, x,y,z, yaw} to place it; PUT /scene/objects/sync {source, objects:[...]} from a detector.",
         ],
@@ -352,6 +353,75 @@ def camera_frame():
     resp.headers["Content-Disposition"] = f"attachment; filename=frame_{b['id']}.npz"
     resp.headers["X-Frame-Id"] = str(b["id"])
     resp.headers["X-Frame-TS"] = repr(b["ts"])
+    return resp
+
+
+@app.route('/camera/stream', methods=['GET'])
+def camera_stream():
+    """Live MJPEG stream for a browser: <img src="/camera/stream">. Query:
+    view=color|depth (depth = colorized preview, max_m=4.0 far clip),
+    fps=10 (1..30), quality=70 (1..100). Auto-starts the camera. Only new
+    framesets are encoded, so the stream never runs faster than the sensor
+    and idles cheaply. Ends as soon as the browser closes the connection;
+    for a single still use /camera/color."""
+    ok, err = camera.ensure_started()
+    if not ok:
+        return _camera_unavailable(err)
+    view = request.args.get("view", "color").lower()
+    if view not in ("color", "depth"):
+        return jsonify({"error": "view must be color or depth"}), 400
+    try:
+        fps = max(1.0, min(30.0, float(request.args.get("fps", "10"))))
+        quality = max(1, min(100, int(request.args.get("quality", "70"))))
+        max_m = float(request.args.get("max_m", "4.0"))
+        if not (0.1 <= max_m <= 20):
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "bad fps / quality / max_m"}), 400
+
+    import cv2
+    import time as _time
+    min_period = 1.0 / fps
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+
+    def frames():
+        last_id = -1
+        last_sent = 0.0
+        idle_since = _time.time()
+        while True:
+            fr = camera.latest()
+            now = _time.time()
+            # Stop if the camera was stopped elsewhere (/camera/stop) or the
+            # grab thread has been silent for a while -- otherwise a dead
+            # stream would hold this worker thread forever.
+            if fr is None or not camera.info().get("streaming"):
+                if now - idle_since > 5.0:
+                    return
+                _time.sleep(0.1)
+                continue
+            if fr["id"] == last_id or now - last_sent < min_period:
+                _time.sleep(0.005)
+                continue
+            idle_since = now
+            if view == "depth":
+                img = camera.depth_preview_bgr(max_m=max_m)
+                if img is None:
+                    _time.sleep(0.05)
+                    continue
+            else:
+                img = fr["color"]
+            ok2, buf = cv2.imencode(".jpg", img, encode_params)
+            if not ok2:
+                return
+            last_id, last_sent = fr["id"], now
+            jpg = buf.tobytes()
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                   b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n"
+                   + jpg + b"\r\n")
+
+    resp = Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Age"] = "0"
     return resp
 
 
