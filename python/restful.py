@@ -4,11 +4,13 @@ import logging
 import math
 import os
 import signal
+import time
 from flask import Flask, Response, jsonify, request
 from threading import Lock
 
 # Log
-from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits, is_user_stop_abort
+from franka import MoveGroupPythonInterfaceTutorial, decode_moveit_error, check_joint_limits, is_user_stop_abort, PANDA_JOINT_LIMITS
+from sensor_msgs.msg import JointState
 from force_viz import ForceVisualizer
 from files_api import bp as files_bp, store as file_store
 import scene_api
@@ -117,7 +119,7 @@ def home():
 # /help introspection -- prefer writing a docstring over adding entries here.
 _HELP_NOTES = {
     "/": "API banner. GET /help for this guide.",
-    "/state": "Current EE pose (meters, base frame) + orientation quaternion + rpy_deg (same orientation as roll/pitch/yaw degrees, matching the motion endpoints' params) + gripper (1=open, 0=closed).",
+    "/state": "Current EE pose (meters, base frame) + orientation quaternion + rpy_deg (same orientation as roll/pitch/yaw degrees, matching the motion endpoints' params) + gripper (1=open, 0=closed) + joints (7 arm joint angles in rad; GET /joints for velocity, torque and limits).",
     "/health": "Probe gripper action servers, motion-lock state, and last ROS error. Use when the API feels stuck.",
     "/recover": "Trigger Franka automatic error recovery (clears reflex errors). 504 if not done within 15 s.",
     "/control/stop": "Stop any ongoing motion and suppress its auto-recovery retry (in-flight request returns outcome=stopped).",
@@ -157,7 +159,7 @@ def api_help():
     return jsonify({
         "name": "Franka Emika Panda REST API",
         "quickstart": [
-            "GET /state to read the robot pose and gripper state.",
+            "GET /state to read the robot pose and gripper state; GET /joints for joint angles, velocities, torques and distance to limits.",
             "GET /force for the live end-effector force/torque estimate.",
             "GET /control/plan_cartesian_path?x=&y=&z= to move (meters, absolute; MOVES THE ARM).",
             "GET /control/gripper_grasp?force=20 to grasp; /control/gripper_open_force to open.",
@@ -493,6 +495,73 @@ def detect_proxy():
                         "msg": f"vision service at {_DETECT_URL} not reachable"}), 502
 
 
+# Latest /joint_states (arm joints 1-7 + fingers, with velocity and measured
+# torque), cached by a subscriber so /joints is lock-free and cheap. Read-only,
+# so the reloader's duplicate subscriber in the supervisor process is harmless.
+_joint_state = {"msg": None, "rx": 0.0}
+def _on_joint_states(msg):
+    _joint_state["msg"] = msg
+    _joint_state["rx"] = time.time()
+rospy.Subscriber("/joint_states", JointState, _on_joint_states, queue_size=1)
+
+
+def _arm_joint_positions():
+    """7 arm joint angles (rad) from the cached /joint_states, or None."""
+    msg = _joint_state["msg"]
+    if msg is None:
+        return None
+    lookup = dict(zip(msg.name, msg.position))
+    try:
+        return [lookup[f"panda_joint{i}"] for i in range(1, 8)]
+    except KeyError:
+        return None
+
+
+@app.route('/joints', methods=['GET'])
+def get_joints():
+    """Current joint state. Arm joints panda_joint1..7 with position (rad and
+    deg), velocity (rad/s), measured torque (Nm), the joint limits and the
+    distance to the nearest limit (a joint closer than ~0.02 rad makes
+    motion endpoints refuse with joint_near_limit). Also finger positions
+    (m, each finger) and gripper width. "positions" is the plain 7-list in
+    radians for scripts. stamp is the ROS time of the sample, age_s how old
+    it is. Lock-free; 503 if no /joint_states has arrived yet."""
+    msg = _joint_state["msg"]
+    if msg is None:
+        return jsonify({"error": "no_joint_state", "msg": "no /joint_states received yet"}), 503
+    import math as _m
+    pos = dict(zip(msg.name, msg.position))
+    vel = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+    eff = dict(zip(msg.name, msg.effort)) if msg.effort else {}
+    joints = []
+    for i in range(1, 8):
+        name = f"panda_joint{i}"
+        if name not in pos:
+            return jsonify({"error": "incomplete_joint_state", "msg": f"{name} missing from /joint_states"}), 503
+        q = pos[name]
+        lo, hi = PANDA_JOINT_LIMITS[i - 1]
+        margin = min(q - lo, hi - q)
+        joints.append({
+            "name": name, "index": i,
+            "position_rad": q, "position_deg": _m.degrees(q),
+            "velocity_rad_s": vel.get(name), "effort_nm": eff.get(name),
+            "limit_lo_rad": lo, "limit_hi_rad": hi,
+            "to_limit_rad": margin, "to_limit_deg": _m.degrees(margin),
+        })
+    fingers = {n: pos[n] for n in ("panda_finger_joint1", "panda_finger_joint2") if n in pos}
+    body = {
+        "positions": [j["position_rad"] for j in joints],
+        "positions_deg": [j["position_deg"] for j in joints],
+        "joints": joints,
+        "fingers": fingers,
+        "gripper_width_m": sum(fingers.values()) if len(fingers) == 2 else None,
+        "near_limit": [j["name"] for j in joints if j["to_limit_rad"] < 0.02],
+        "stamp": msg.header.stamp.to_sec(),
+        "age_s": round(time.time() - _joint_state["rx"], 3),
+    }
+    return jsonify(body), 200
+
+
 @app.route('/state', methods = ['GET'])
 def get_state():
     pose = robot.move_group.get_current_pose()
@@ -516,6 +585,11 @@ def get_state():
         },
         "gripper": gripper
     }
+    # Arm joint angles (rad, joint1..7) -- /joints has velocity/torque/limits.
+    q = _arm_joint_positions()
+    if q is None:
+        q = robot.move_group.get_current_joint_values()
+    state_dict["joints"] = list(q)
     # Same orientation as human-friendly Euler angles (degrees, sxyz, base
     # frame) -- matches the roll/pitch/yaw params the motion endpoints accept.
     try:
