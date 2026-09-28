@@ -40,6 +40,8 @@
   input[type=radio], input[type=checkbox] { width:auto; padding:0; margin:0 4px 0 0;
                                             vertical-align:middle; }
   input[type=file] { width:auto; max-width:16em; padding:5px; }
+  select { padding:7px 6px; border:1px solid var(--line); border-radius:7px; font-size:14px;
+           background:#fff; }
   label { font-size:13px; color:var(--mut); }
   #jog { display:grid; grid-template-columns:repeat(4,64px); grid-auto-rows:52px;
          gap:6px; justify-content:start; }
@@ -148,7 +150,12 @@
       <button id="camtoggle" class="good" onclick="toggleCamera()">Turn camera on</button>
       <label><input type="radio" name="camview" value="color" checked onchange="restartStream()"> color</label>
       <label><input type="radio" name="camview" value="depth" onchange="restartStream()"> depth</label>
-      <label>fps</label><input id="camfps" type="number" min="1" max="30" step="1" value="10"
+      <label>resolution</label>
+      <select id="camres" onchange="fillSensorFps(); applyCamMode()"></select>
+      <label>sensor fps</label>
+      <select id="camsfps" onchange="applyCamMode()"></select>
+      <label title="how many frames per second the browser receives (≤ sensor fps)">view fps</label>
+      <input id="camfps" type="number" min="1" max="30" step="1" value="10"
              style="width:60px" onchange="restartStream()">
       <button class="ghost" onclick="window.open('/camera/color?format=png', '_blank')">Snapshot (PNG)</button>
       <span id="camdot"></span><span id="caminfo" style="font-size:13px;color:var(--mut)">off</span>
@@ -411,17 +418,98 @@ function startStream() {
   $('camoff').style.display = 'none';
 }
 function restartStream() { if (camOn) { stopStream(); startStream(); } }
+// ---- resolution / sensor fps ----
+// Modes come from GET /camera/config (color modes, [w, h, fps]). The server
+// validates a mode against the real device and rolls back if it is refused.
+let camModes = [];          // [[w, h, fps], ...]
+let camCur = null;          // {width, height, fps} as the server reports it
+function camInfoText(i) {
+  return `${i.width}x${i.height} @ ${i.fps} fps${i.serial ? ' · ' + i.serial : ''}`;
+}
+function selectedMode() {
+  const [w, h] = $('camres').value.split('x').map(Number);
+  return { width: w, height: h, fps: Number($('camsfps').value) };
+}
+function fillSensorFps(prefer) {
+  const [w, h] = $('camres').value.split('x').map(Number);
+  const fpsList = camModes.filter(m => m[0] === w && m[1] === h).map(m => m[2]);
+  const want = prefer ?? Number($('camsfps').value);
+  const pick = fpsList.includes(want) ? want : (fpsList.includes(15) ? 15 : fpsList[0]);
+  $('camsfps').innerHTML = fpsList.map(f => `<option value="${f}"${f === pick ? ' selected' : ''}>${f}</option>`).join('');
+}
+async function loadCamModes() {
+  const r = await callApi('/camera/config', 'camera modes', 10000);
+  if (r.status !== 200 || !r.body) return;
+  camModes = (r.body.supported_modes && r.body.supported_modes.color) || [];
+  camCur = r.body.current;
+  const res = [...new Set(camModes.map(m => `${m[0]}x${m[1]}`))];
+  const curRes = `${camCur.width}x${camCur.height}`;
+  if (!res.includes(curRes)) res.push(curRes);
+  $('camres').innerHTML = res.map(x => `<option value="${x}"${x === curRes ? ' selected' : ''}>${x}</option>`).join('');
+  fillSensorFps(camCur.fps);
+}
+function modeDiffers(m) {
+  return !camCur || m.width !== camCur.width || m.height !== camCur.height || m.fps !== camCur.fps;
+}
+// Apply the selected mode. With the camera off we only remember it -- it is
+// applied (via /camera/config, which also starts the device) on turn-on.
+async function applyCamMode() {
+  if (!camOn) {
+    const m = selectedMode();
+    $('caminfo').textContent = modeDiffers(m) ? `off · will start at ${m.width}x${m.height} @ ${m.fps}` : 'off';
+    return;
+  }
+  const m = selectedMode();
+  if (!modeDiffers(m)) return;
+  const btn = $('camtoggle'); btn.disabled = true;
+  $('camres').disabled = $('camsfps').disabled = true;
+  stopStream();                         // release the stream before the device restarts
+  $('caminfo').textContent = `switching to ${m.width}x${m.height} @ ${m.fps}…`;
+  try {
+    const r = await callApi(`/camera/config?width=${m.width}&height=${m.height}&fps=${m.fps}`,
+                            'camera mode', 30000);
+    if (r.status === 200) {
+      camCur = { width: r.body.width, height: r.body.height, fps: r.body.fps };
+      $('caminfo').textContent = camInfoText(r.body);
+    } else {
+      // device refused the mode; server rolled back -- show what is really running
+      const back = r.body && r.body.restored;
+      if (back) {
+        camCur = back;
+        $('camres').value = `${back.width}x${back.height}`; fillSensorFps(back.fps);
+      }
+      $('caminfo').textContent = `mode refused: ${(r.body && r.body.msg) || 'error'}`;
+    }
+  } finally {
+    btn.disabled = false;
+    $('camres').disabled = $('camsfps').disabled = false;
+    if (camOn) startStream();
+  }
+}
+
 async function toggleCamera() {
   const btn = $('camtoggle');
   btn.disabled = true;
   try {
     if (!camOn) {
-      const r = await callApi('/camera/start', 'camera start', 20000);
-      if (r.status !== 200) { $('caminfo').textContent = (r.body && r.body.msg) || 'camera unavailable'; return; }
+      // Start in the selected mode; /camera/config starts the device too.
+      const m = selectedMode();
+      const r = (camModes.length && modeDiffers(m))
+        ? await callApi(`/camera/config?width=${m.width}&height=${m.height}&fps=${m.fps}`, 'camera start', 30000)
+        : await callApi('/camera/start', 'camera start', 20000);
+      if (r.status !== 200) {
+        $('caminfo').textContent = (r.body && r.body.msg) || 'camera unavailable';
+        if (r.body && r.body.restored) {
+          camCur = r.body.restored;
+          $('camres').value = `${camCur.width}x${camCur.height}`; fillSensorFps(camCur.fps);
+        }
+        return;
+      }
       camOn = true;
       btn.textContent = 'Turn camera off'; btn.className = 'warn';
       const i = r.body || {};
-      $('caminfo').textContent = `${i.width}x${i.height} @ ${i.fps} fps${i.serial ? ' · ' + i.serial : ''}`;
+      camCur = { width: i.width, height: i.height, fps: i.fps };
+      $('caminfo').textContent = camInfoText(i);
       startStream();
     } else {
       camOn = false;
@@ -432,6 +520,8 @@ async function toggleCamera() {
     }
   } finally { btn.disabled = false; }
 }
+loadCamModes();
+
 // Don't leave a stream (and the USB device) held open by a hidden tab.
 document.addEventListener('visibilitychange', () => {
   if (!camOn) return;
