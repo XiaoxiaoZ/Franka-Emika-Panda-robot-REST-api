@@ -573,6 +573,52 @@ class MoveGroupPythonInterfaceTutorial(object):
             move_group.stop()
         return result
 
+    def plan_joint_goal(self, joint_goal, velocity_scaling=0.2, acceleration_scaling=0.1):
+        """Plan (don't execute) a move to an explicit 7-joint target.
+
+        Pilz PTP first: it interpolates straight in joint space, so every
+        joint moves monotonically from start to goal -- no detours, no
+        surprise swings. If PTP fails (typically the straight joint-space
+        path collides) fall back to OMPL RRTConnect. The pipeline is restored
+        to OMPL afterwards because the other motion methods only set
+        planner_id and assume the default pipeline.
+
+        Returns (plan_success, plan, planning_time, error_code, planner_used).
+        """
+        move_group = self.move_group
+        move_group.clear_pose_targets()
+        move_group.clear_path_constraints()
+        move_group.set_start_state_to_current_state()
+        move_group.set_joint_value_target(list(joint_goal))
+        move_group.set_max_velocity_scaling_factor(velocity_scaling)
+        move_group.set_max_acceleration_scaling_factor(acceleration_scaling)
+        attempts = [("pilz_industrial_motion_planner", "PTP"), ("ompl", "RRTConnect")]
+        result = (False, None, 0.0, None, None)
+        try:
+            for pipeline, planner in attempts:
+                move_group.set_planning_pipeline_id(pipeline)
+                move_group.set_planner_id(planner)
+                move_group.set_num_planning_attempts(1 if planner == "PTP" else 10)
+                move_group.set_planning_time(5.0)
+                ok, plan, t, err = move_group.plan()
+                if ok:
+                    if planner != "PTP":
+                        # OMPL output is untimed-ish; give it the same limits
+                        plan = move_group.retime_trajectory(
+                            self.robot.get_current_state(), plan,
+                            velocity_scaling_factor=velocity_scaling,
+                            acceleration_scaling_factor=acceleration_scaling)
+                    return (True, plan, t, err, planner)
+                rospy.logwarn("goto_joints: %s/%s failed (%s)", pipeline, planner,
+                              decode_moveit_error(err))
+                result = (False, plan, t, err, None)
+        finally:
+            move_group.set_planning_pipeline_id("ompl")
+            move_group.set_max_velocity_scaling_factor(1.0)
+            move_group.set_max_acceleration_scaling_factor(1.0)
+            move_group.clear_pose_targets()
+        return result
+
     def clear_stop(self):
         """Clear the user-stop flag so a new (multi-step) motion routine can run.
         Mirrors what plan_and_execute_with_retry does at the start of a motion."""

@@ -253,6 +253,23 @@ Some parts of this codebase are known-limited or known-broken. Expect follow-up 
 - **Gripper auto-recovery** — implemented as a generic retry wrapper (`_gripper_action_call`). On failure or timeout, optionally calls `/franka_control/error_recovery` and retries the action. Default is one retry. **Context-awareness is the caller's responsibility:** for transit scenarios (gripper already holding an object mid-transport), pass `max_retries=0` to avoid a reset-and-retry that could disturb the grasp.
 - **Simulation / scene API — basic.** `/simulation/add_box` hardcodes a single fixed-size cube; `self.box_name` is a single slot that `add_floor()` overwrites, which can cause `/simulation/remove_box` to remove the wrong object. No shape/size/pose parameters. Scene mutations don't take the motion lock. Needs a dedicated redesign pass.
 
+## Joint-space moves (`/control/goto_joints`)
+
+```
+curl "http://172.26.0.212:5000/joints"                                              # read (rad + deg, torque, limits)
+curl "http://172.26.0.212:5000/control/goto_joints?joints=0,-45,0,-90,0,60,45&unit=deg&dry_run=1"   # preview
+curl "http://172.26.0.212:5000/control/goto_joints?joints=0,-45,0,-90,0,60,45&unit=deg"             # move
+curl "http://172.26.0.212:5000/control/goto_joints?j7=1.2"                          # change one joint only
+```
+
+Planned with Pilz PTP (straight line in joint space, every joint moves
+monotonically; OMPL RRTConnect fallback). `velocity` 0.01..0.5 (default 0.2).
+The target must be more than 0.02 rad inside the limits (400
+`target_near_limit`), and the big-swing guard applies (409 `plan_too_large`
+over 100° on J1..J6; `max_joint_travel_deg` to override). `dry_run=1`
+returns the planner, duration and per-joint travel without moving.
+`/control/stop` and `/control/resume` work as for the other motions.
+
 ## File store (`/files`)
 
 A sandboxed HTTP file store on the same server, so other machines (the object

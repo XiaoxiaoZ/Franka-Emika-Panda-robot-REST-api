@@ -163,6 +163,7 @@ def api_help():
             "GET /force for the live end-effector force/torque estimate.",
             "GET /control/plan_cartesian_path?x=&y=&z= to move (meters, absolute; MOVES THE ARM).",
             "GET /control/gripper_grasp?force=20 to grasp; /control/gripper_open_force to open.",
+            "GET /control/goto_joints?joints=0,-45,0,-135,0,90,45&unit=deg to move to a joint configuration (dry_run=1 to preview; MOVES THE ARM).",
             "GET /control/stop to stop motion; GET /recover to clear reflex errors.",
             "GET /camera/stream (MJPEG, browser-viewable) for a live view; /camera/color for a still; /camera/start and /camera/stop control the device.",
             "PUT /files/cad/part.stl (raw body) to store a CAD model on the server; GET /files?q=*.stl to find it.",
@@ -1137,6 +1138,147 @@ def plan_joint_path_impl():
         return jsonify({"error": "Robot is busy"}), 409
     try: return plan_joint_path()
     finally: moveit_lock.release()
+def _parse_goto_joints(current):
+    """Target for goto_joints from query args or a JSON body.
+    joints=<7 comma-separated values> (or JSON "joints": [...]) sets all
+    seven; j1..j7=<value> override single joints, starting from the current
+    configuration (so j7=1.2 alone just turns the wrist). unit=rad|deg
+    (default rad). Raises ValueError with a readable message."""
+    data = request.get_json(silent=True) if request.method == "POST" else None
+    data = data if isinstance(data, dict) else {}
+    get = lambda k: data.get(k, request.args.get(k))
+    unit = str(get("unit") or "rad").lower()
+    if unit not in ("rad", "deg"):
+        raise ValueError("unit must be rad or deg")
+    conv = math.radians if unit == "deg" else float
+    target = list(current)
+    given = False
+    raw = get("joints")
+    if raw is not None:
+        vals = raw if isinstance(raw, list) else [v for v in str(raw).replace("[", "").replace("]", "").split(",") if v.strip()]
+        if len(vals) != 7:
+            raise ValueError(f"joints needs exactly 7 values, got {len(vals)}")
+        target = [conv(float(v)) for v in vals]
+        given = True
+    for i in range(1, 8):
+        v = get(f"j{i}")
+        if v is not None:
+            target[i - 1] = conv(float(v))
+            given = True
+    if not given:
+        raise ValueError("give joints=<7 values> and/or j1..j7=<value>")
+    for i, q in enumerate(target):
+        if math.isnan(q) or math.isinf(q):
+            raise ValueError(f"j{i + 1} must be finite")
+    return target, unit
+
+
+def _do_goto_joints(target, auto_recover, max_retries, velocity, max_joint_travel, dry_run=False):
+    # Target must be clear of the limits by the same margin the controller
+    # needs -- a goal ON the limit plans fine and then never executes.
+    bad = check_joint_limits(target)
+    if bad:
+        return jsonify({"error": "target_near_limit",
+                        "msg": "target puts a joint within 0.02 rad of its limit",
+                        "joints_near_limit": bad}), 400
+    if not dry_run:
+        ok, rejection = _preflight_joint_limit_check()
+        if not ok:
+            return rejection
+
+    def plan_fn():
+        ok_, plan, t, err, planner = robot.plan_joint_goal(target, velocity_scaling=velocity)
+        return plan, bool(ok_), {"planning_time": t, "error_code": err, "planner_used": planner}
+
+    if dry_run:
+        from franka import trajectory_joint_travel
+        plan, ok_, meta = plan_fn()
+        travel = trajectory_joint_travel(plan) if ok_ else {}
+        limit = max_joint_travel if max_joint_travel is not None else robot.MAX_JOINT_TRAVEL_RAD
+        too_far = [j for j, t in travel.items()
+                   if limit and t > limit and j not in robot.JOINT_TRAVEL_EXEMPT]
+        body = {
+            "outcome": "planned" if ok_ else "plan_failed",
+            "dry_run": True,
+            "planner_used": meta["planner_used"],
+            "planning_time": meta["planning_time"],
+            "waypoints": len(plan.joint_trajectory.points) if ok_ else 0,
+            "duration_s": plan.joint_trajectory.points[-1].time_from_start.to_sec() if ok_ and plan.joint_trajectory.points else None,
+            "joint_travel_deg": {j: round(math.degrees(t), 1) for j, t in travel.items()},
+            "would_be_rejected_as_too_large": too_far,
+            "target_rad": target,
+        }
+        if not ok_:
+            body["moveit_error"] = decode_moveit_error(meta["error_code"])
+        return jsonify(body), 200 if ok_ else 202
+
+    baseline = len(last_error)
+
+    def get_new_error():
+        return last_error[-1] if len(last_error) > baseline else None
+
+    outcome = robot.plan_and_execute_with_retry(
+        plan_fn,
+        auto_recover=auto_recover,
+        max_retries=max_retries,
+        get_last_error=get_new_error,
+        max_joint_travel_rad=max_joint_travel,
+    )
+    extra = {"planner_used": outcome['plan_metadata'].get('planner_used'),
+             "planning_time": str(outcome['plan_metadata'].get('planning_time')),
+             "target_rad": target}
+    if outcome['outcome'] == 'plan_failed':
+        extra["moveit_error"] = decode_moveit_error(outcome['plan_metadata'].get('error_code'))
+    return _format_motion_response(outcome, extra)
+
+
+@app.route('/control/goto_joints', methods=['GET', 'POST'])
+def goto_joints_impl():
+    """Move to an explicit joint configuration. joints=<7 values> (J1..J7)
+    and/or j1..j7=<value> to change single joints from the current pose;
+    unit=rad|deg (default rad); POST JSON {"joints": [...], "unit": "deg"}
+    works too. Planned with Pilz PTP (straight line in joint space: every
+    joint moves monotonically, no detours), OMPL RRTConnect as fallback.
+    velocity=0.2 (0.01..0.5 of max joint speed). dry_run=1 plans only and
+    reports planner, duration and per-joint travel without moving. Same
+    safety as the other motion endpoints: target must be >0.02 rad inside
+    the limits (400 target_near_limit), big-swing guard
+    max_joint_travel_deg=100 except J7 (409 plan_too_large; 0 disables),
+    auto_recover=1, max_retries=1, /control/stop, /control/resume.
+    Example: /control/goto_joints?joints=0,-45,0,-135,0,90,45&unit=deg.
+    WARNING: moves the arm (unless dry_run=1)."""
+    try:
+        current = robot.move_group.get_current_joint_values()
+        target, _unit = _parse_goto_joints(current)
+        data = request.get_json(silent=True) if request.method == "POST" else None
+        data = data if isinstance(data, dict) else {}
+        get = lambda k, d=None: data.get(k, request.args.get(k, d))
+        velocity = float(get("velocity", "0.2"))
+        if not (0.01 <= velocity <= 0.5):
+            raise ValueError("velocity must be in 0.01..0.5")
+        auto_recover = str(get("auto_recover", "1")) not in ("0", "false", "False")
+        max_retries = int(get("max_retries", "1"))
+        dry_run = str(get("dry_run", "0")) not in ("0", "false", "False")
+        mjt = get("max_joint_travel_deg")
+        max_joint_travel = None if mjt is None else math.radians(float(mjt))
+        if max_joint_travel is not None and max_joint_travel < 0:
+            raise ValueError("max_joint_travel_deg must be >= 0")
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": "bad goto_joints args", "msg": str(e)}), 400
+
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try:
+        if not dry_run:
+            global _last_motion
+            _last_motion = {'kind': 'joints', 'target': target, 'auto_recover': auto_recover,
+                            'max_retries': max_retries, 'velocity': velocity,
+                            'max_joint_travel': max_joint_travel}
+        return _do_goto_joints(target, auto_recover, max_retries, velocity, max_joint_travel, dry_run)
+    finally:
+        moveit_lock.release()
+
+
 @app.route('/control/resume', methods = ['GET'])
 def resume_impl():
     """Re-issue the last requested motion from the robot's current position.
@@ -1171,6 +1313,9 @@ def resume_impl():
                              orientation=lm.get('orientation'),
                              planner_id=lm.get('planner_id', 'LIN'),
                              max_joint_travel=lm.get('max_joint_travel'))
+        if lm['kind'] == 'joints':
+            return _do_goto_joints(lm['target'], lm['auto_recover'], lm['max_retries'],
+                                   lm['velocity'], lm.get('max_joint_travel'))
         return jsonify({"error": f"unknown cached motion kind: {lm.get('kind')}"}), 500
     finally:
         moveit_lock.release()
