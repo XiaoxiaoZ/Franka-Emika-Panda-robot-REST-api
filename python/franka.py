@@ -573,6 +573,25 @@ class MoveGroupPythonInterfaceTutorial(object):
             move_group.stop()
         return result
 
+    def check_joint_state(self, joint_values):
+        """Collision-check a 7-joint arm configuration against the current
+        planning scene (self-collision, walls, ceiling, floor, CAD objects,
+        anything attached to the hand) via move_group's /check_state_validity.
+        Returns (valid, contacts) with contacts a sorted list of unique
+        "link <-> object" pairs. Raises RuntimeError if the service is down."""
+        from moveit_msgs.srv import GetStateValidity, GetStateValidityRequest
+        rospy.wait_for_service("/check_state_validity", timeout=3.0)
+        srv = rospy.ServiceProxy("/check_state_validity", GetStateValidity)
+        state = self.robot.get_current_state()      # keeps fingers + attached objects
+        names = list(state.joint_state.name)
+        pos = list(state.joint_state.position)
+        for i, q in enumerate(joint_values, start=1):
+            pos[names.index(f"panda_joint{i}")] = q
+        state.joint_state.position = pos
+        res = srv(GetStateValidityRequest(robot_state=state, group_name=self.move_group.get_name()))
+        pairs = sorted({" <-> ".join(sorted((c.contact_body_1, c.contact_body_2))) for c in res.contacts})
+        return bool(res.valid), pairs
+
     def plan_joint_goal(self, joint_goal, velocity_scaling=0.2, acceleration_scaling=0.1):
         """Plan (don't execute) a move to an explicit 7-joint target.
 

@@ -43,8 +43,14 @@ def _on_store_error(e):
 def _upload(rel):
     abs_path = store.resolve(rel)
     overwrite = _flag("overwrite", True)
-    if request.files and "file" in request.files:
-        f = request.files["file"]
+    # Only a multipart body is a form upload. Touching request.files for any
+    # other body makes Werkzeug parse it as a form -- clients that send raw
+    # bytes as application/x-www-form-urlencoded (urllib's default) would
+    # then have their body consumed and a 0-byte file stored.
+    if request.mimetype == "multipart/form-data":
+        f = request.files.get("file")
+        if f is None:
+            raise FileStoreError(400, "bad_request", 'multipart upload needs a field named "file"')
         info = store.write_stream(abs_path, f.stream, overwrite=overwrite)
     else:
         info = store.write_stream(abs_path, request.stream,

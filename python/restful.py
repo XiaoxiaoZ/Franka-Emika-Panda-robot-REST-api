@@ -1181,6 +1181,16 @@ def _do_goto_joints(target, auto_recover, max_retries, velocity, max_joint_trave
         return jsonify({"error": "target_near_limit",
                         "msg": "target puts a joint within 0.02 rad of its limit",
                         "joints_near_limit": bad}), 400
+    # A goal in collision can only fail, and slowly (PTP refuses, then OMPL
+    # samples until it times out) -- check it up front and say why.
+    try:
+        valid, contacts = robot.check_joint_state(target)
+    except Exception as e:
+        return jsonify({"error": "validity_check_unavailable", "msg": str(e)}), 503
+    if not valid:
+        return jsonify({"error": "target_in_collision",
+                        "msg": "the target configuration collides with the robot itself or the planning scene",
+                        "contacts": contacts}), 400
     if not dry_run:
         ok, rejection = _preflight_joint_limit_check()
         if not ok:
@@ -1242,7 +1252,9 @@ def goto_joints_impl():
     velocity=0.2 (0.01..0.5 of max joint speed). dry_run=1 plans only and
     reports planner, duration and per-joint travel without moving. Same
     safety as the other motion endpoints: target must be >0.02 rad inside
-    the limits (400 target_near_limit), big-swing guard
+    the limits (400 target_near_limit) and collision-free (400
+    target_in_collision, with the contact pairs); the planned path is
+    collision-checked against the planning scene too; big-swing guard
     max_joint_travel_deg=100 except J7 (409 plan_too_large; 0 disables),
     auto_recover=1, max_retries=1, /control/stop, /control/resume.
     Example: /control/goto_joints?joints=0,-45,0,-135,0,90,45&unit=deg.

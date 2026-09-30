@@ -42,52 +42,50 @@ class SceneError(Exception):
 
 # ---------------------------------------------------------------- meshes ----
 
-def _walk_assimp(node, parent_tf, scene, out):
-    """Collect (vertices, faces) of every mesh under ``node`` with the node
-    transforms applied (moveit_commander.make_mesh only takes meshes[0])."""
-    tf = parent_tf @ np.asarray(node.transformation, dtype=float).reshape(4, 4)
-    for m in node.meshes:
-        verts = np.asarray(m.vertices, dtype=float)
-        if verts.size == 0:
-            continue
-        faces = [f for f in np.asarray(m.faces) if len(f) == 3] if hasattr(m.faces[0], "__len__") \
-            else [f.indices for f in m.faces if len(f.indices) == 3]
-        if not faces:
-            continue
-        hom = np.hstack([verts, np.ones((len(verts), 1))])
-        out.append(((hom @ tf.T)[:, :3], np.asarray(faces, dtype=int)))
-    for child in node.children:
-        _walk_assimp(child, tf, scene, out)
+MESH_PARSE_TIMEOUT_S = 60
+
+
+def _parse_mesh_isolated(abs_path):
+    """(vertices N x 3, faces M x 3) via mesh_parse.py in a subprocess, so a
+    pyassimp crash on a malformed upload kills only that child."""
+    import subprocess
+    import sys
+    import tempfile
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mesh_parse.py")
+    fd, out = tempfile.mkstemp(suffix=".npz")
+    os.close(fd)
+    try:
+        try:
+            proc = subprocess.run([sys.executable, script, abs_path, out], capture_output=True,
+                                  text=True, timeout=MESH_PARSE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise SceneError(422, "mesh_timeout", f"parsing took longer than {MESH_PARSE_TIMEOUT_S} s")
+        if proc.returncode < 0:
+            raise SceneError(422, "mesh_unreadable",
+                             f"the mesh parser crashed (signal {-proc.returncode}); the file is malformed or unsupported")
+        if proc.returncode != 0:
+            reason = (proc.stderr.strip().splitlines() or ["mesh parser failed"])[-1]
+            raise SceneError(422, "mesh_unreadable", reason)
+        with np.load(out) as data:
+            return data["vertices"].astype(float), data["faces"].astype(np.int64)
+    finally:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
 
 
 def load_mesh_file(abs_path, scale=1.0, collision="mesh"):
     """Parse a mesh file into (shape_msgs/Mesh, stats dict)."""
-    import pyassimp
     from shape_msgs.msg import Mesh, MeshTriangle
     from geometry_msgs.msg import Point
 
     if collision not in COLLISION_MODES:
         raise SceneError(400, "bad_collision", f"collision must be one of {COLLISION_MODES}")
-    try:
-        scene = pyassimp.load(abs_path)
-    except Exception as e:
-        raise SceneError(422, "mesh_unreadable", f"pyassimp could not read the file: {e}")
-    try:
-        parts = []
-        _walk_assimp(scene.rootnode, np.eye(4), scene, parts)
-    finally:
-        pyassimp.release(scene)
-    if not parts:
-        raise SceneError(422, "mesh_empty", "no triangles found in the file")
-    verts = []
-    faces = []
-    offset = 0
-    for v, f in parts:
-        verts.append(v)
-        faces.append(f + offset)
-        offset += len(v)
-    verts = np.vstack(verts) * float(scale)
-    faces = np.vstack(faces)
+    if os.path.getsize(abs_path) == 0:
+        raise SceneError(422, "mesh_empty", "the file is empty (0 bytes)")
+    verts, faces = _parse_mesh_isolated(abs_path)
+    verts = verts * float(scale)
     source_triangles = int(len(faces))
 
     if collision == "convex_hull":

@@ -160,6 +160,11 @@ class FileStore:
                         raise FileStoreError(507, "quota_exceeded", f"store quota of {self.quota_bytes} bytes exceeded")
                     out.write(chunk)
                     h.update(chunk)
+            # mkstemp creates 0600; stored files should be readable like any
+            # other (umask-respecting) file, e.g. by a server run as another user
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
             os.replace(tmp, abs_path)
         except Exception:
             try:
