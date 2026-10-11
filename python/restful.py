@@ -14,7 +14,10 @@ from sensor_msgs.msg import JointState
 from force_viz import ForceVisualizer
 from files_api import bp as files_bp, store as file_store
 import scene_api
+import scene_v2_api
+import plan_api
 from scene_manager import SceneManager
+from scene_core import SceneCore, MoveItSceneIO
 from payload_id import PayloadIdentifier
 from realsense_cam import RealsenseCamera
 import rospy
@@ -44,11 +47,17 @@ app.register_blueprint(files_bp)
 # /scene: CAD models + objects in the planning scene (wired up after the
 # robot interface exists, below).
 app.register_blueprint(scene_api.bp)
+# /scene/info, /scene/batch, /scene/namespaces: namespaced, versioned v2 scene.
+app.register_blueprint(scene_v2_api.bp)
+# /plan/check_state, /plan/dry_run: plan-only checks, never move the robot.
+app.register_blueprint(plan_api.bp)
 
 # Flask debug mode (and its auto-reloader). The reloader re-executes this
 # module in a child process, so module-level singletons are built twice unless
-# guarded -- see the force_viz guard below. Override with FRANKA_RESTFUL_DEBUG=0.
-DEBUG = os.environ.get('FRANKA_RESTFUL_DEBUG', '1') != '0'
+# guarded -- see the force_viz guard below. OFF by default (safety rule S5: the
+# Werkzeug debugger is a remote-execution surface and the reloader runs the
+# startup -- scene restore, walls -- twice); FRANKA_RESTFUL_DEBUG=1 to enable.
+DEBUG = os.environ.get('FRANKA_RESTFUL_DEBUG', '0') == '1'
 
 @app.errorhandler(Exception)
 def _on_unhandled_exception(e):
@@ -79,14 +88,121 @@ robot.add_virtual_walls()
 # CAD models / detected objects in the planning scene. State lives next to
 # the /files store and is re-applied here because move_group forgets its
 # world on restart.
-scene_manager = SceneManager(robot.scene, file_store,
-                             os.path.join(file_store.root, "scene.json"),
+# Scene state lives OUTSIDE the /files store (safety rule S6: anyone could
+# otherwise rewrite it through PUT /files/scene.json).
+STATE_DIR = os.environ.get("FRANKA_STATE_DIR",
+                           os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state"))
+os.makedirs(STATE_DIR, exist_ok=True)
+_legacy_state = os.path.join(STATE_DIR, "scene.json")
+_old_state = os.path.join(file_store.root, "scene.json")
+if os.path.isfile(_old_state) and not os.path.exists(_legacy_state):
+    os.replace(_old_state, _legacy_state)          # one-time migration out of /files
+    rospy.logwarn("moved %s -> %s", _old_state, _legacy_state)
+
+scene_manager = SceneManager(robot.scene, file_store, _legacy_state,
                              planning_frame=robot.move_group.get_planning_frame(),
                              logger=rospy.logwarn)
 scene_api.init(scene_manager, moveit_lock)
 _restored = scene_manager.restore()
 rospy.loginfo("scene restored: %d models, %d objects%s", _restored["models"], _restored["objects"],
               (" -- errors: %s" % _restored["errors"]) if _restored["errors"] else "")
+
+scene_core = SceneCore(MoveItSceneIO(), file_store, os.path.join(STATE_DIR, "scene_v2.json"),
+                       planning_frame=robot.move_group.get_planning_frame(),
+                       logger=rospy.logwarn, legacy=scene_manager)
+scene_manager.on_change = scene_core.bump_for_legacy_change
+scene_manager.is_reserved = lambda name: name in scene_core.objects
+_restored_v2 = scene_core.load_and_restore()
+rospy.loginfo("scene v2 restored: %s", _restored_v2)
+
+
+def _urdf_robot_name():
+    import xml.etree.ElementTree as ET
+    try:
+        return ET.fromstring(rospy.get_param("/robot_description")).get("name")
+    except Exception:
+        return None
+
+
+def _robot_info():
+    """Static-ish robot facts for GET /scene/info."""
+    import hashlib
+    import rospkg
+    pf = robot.move_group.get_planning_frame()
+    def _sha(param):
+        try:
+            return hashlib.sha256(rospy.get_param(param).encode("utf-8")).hexdigest()
+        except Exception:
+            return None
+    try:
+        moveit_version = rospkg.RosPack().get_manifest("moveit_commander").version
+    except Exception:
+        moveit_version = None
+    info = {
+        "moveit_version": moveit_version,
+        "planning_frame": pf,
+        "robot_name": _urdf_robot_name(),
+        "urdf_sha256": _sha("/robot_description"),
+        "srdf_sha256": _sha("/robot_description_semantic"),
+        "groups": {"arm": robot.move_group.get_name(), "hand": robot.hand_group.get_name()},
+        "ee_link": robot.move_group.get_end_effector_link(),
+    }
+    if pf == "panda_link0":
+        info["planning_frame_to_panda_link0"] = {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]}
+    else:
+        info["planning_frame_to_panda_link0"] = None
+        info["warning"] = "planning frame is not panda_link0; only panda_link0 frame_ids are accepted"
+    return info
+
+
+scene_v2_api.init(scene_core, moveit_lock, _robot_info)
+plan_api.init(robot, scene_core)
+
+# Wrist camera (D435 + bracket) as a box attached to the hand, so plan-only
+# checks represent the real robot. PLACEHOLDER size/offset (TCP frame, m)
+# derived from the hand-eye calibration (optical centre ~(-0.031,-0.032,
+# -0.035), long axis along TCP y) until the lab measures it; override with
+# FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz", disable with FRANKA_WRIST_CAMERA=0.
+_CAM_DEFAULT = (0.045, 0.12, 0.05, -0.031, -0.032, -0.047)
+if os.environ.get("FRANKA_WRIST_CAMERA", "1") != "0":
+    _cam_env = os.environ.get("FRANKA_WRIST_CAMERA_BOX")
+    _cam = tuple(float(v) for v in _cam_env.split(",")) if _cam_env else _CAM_DEFAULT
+    _cam_spec = {"id": "wrist_camera", "link": "panda_hand", "frame": "panda_hand_tcp",
+                 "size": list(_cam[:3]), "center": list(_cam[3:6]), "placeholder": _cam_env is None,
+                 "touch_links": ["panda_hand", "panda_leftfinger", "panda_rightfinger", "panda_link7"]}
+    if scene_core.io.attach_box(_cam_spec["id"], _cam_spec["link"], _cam_spec["frame"], _cam_spec["size"],
+                                _cam_spec["center"], _cam_spec["touch_links"]):
+        scene_core.builtin_attached = _cam_spec
+        rospy.loginfo("wrist camera collision box attached (%s)", "PLACEHOLDER size" if _cam_spec["placeholder"] else "configured size")
+    else:
+        rospy.logerr("wrist camera collision box could NOT be attached")
+
+
+# Safety gate for every motion endpoint (rules S2 + S4): refuse while the
+# scene is dirty (a commit could not be confirmed or rolled back) and when
+# the caller's expect_scene_version is stale. /control/stop always passes;
+# dry runs (dry_run=1) don't move, so they pass too.
+@app.before_request
+def _motion_scene_gate():
+    path = request.path
+    if not path.startswith("/control/") or path == "/control/stop":
+        return None
+    if request.args.get("dry_run", "0") not in ("0", "false", ""):
+        return None
+    if scene_core.dirty:
+        return jsonify({"error": "scene_dirty", "msg": "the planning scene is in an unconfirmed state; "
+                        "push a successful /scene/batch or DELETE /scene/namespaces/<ns> first",
+                        "dirty_reason": scene_core.dirty_reason}), 409
+    expect = request.args.get("expect_scene_version")
+    if expect is not None:
+        try:
+            expect = int(expect)
+        except ValueError:
+            return jsonify({"error": "bad_request", "msg": "expect_scene_version must be an integer"}), 400
+        if expect != scene_core.version:
+            return jsonify({"error": "version_conflict", "scene_version": scene_core.version,
+                            "msg": f"scene_version is {scene_core.version}, request expects {expect}"}), 409
+    return None
 
 # End-effector force visualization: subscribes to /franka_state_controller/F_ext
 # and publishes an arrow+label MarkerArray to /franka_ee_force for RViz.
@@ -168,6 +284,7 @@ def api_help():
             "GET /camera/stream (MJPEG, browser-viewable) for a live view; /camera/color for a still; /camera/start and /camera/stop control the device.",
             "PUT /files/cad/part.stl (raw body) to store a CAD model on the server; GET /files?q=*.stl to find it.",
             "POST /scene/models {name, file, scale} to register it; POST /scene/objects {name, model, x,y,z, yaw} to place it; PUT /scene/objects/sync {source, objects:[...]} from a detector.",
+            "Scene API v2 for whole-scene pushes: GET /scene/info, POST /scene/batch (atomic, primitives + meshes, namespaces), POST /plan/check_state and /plan/dry_run (plan only, never moves).",
         ],
         "conventions": {
             "units": "meters, Newtons, N*m, radians; positions are absolute in the robot base frame",
@@ -607,6 +724,12 @@ def get_state():
     
 @app.route('/simulation/remove_box', methods = ['GET'])
 def remove_box():
+    # add_floor() reuses the same single name slot, so this used to delete
+    # the floor; built-in safety geometry is never removed here.
+    from scene_manager import BUILTIN_OBJECTS
+    if robot.box_name in BUILTIN_OBJECTS:
+        return jsonify({"error": "builtin", "msg": f"{robot.box_name!r} is built-in safety geometry; "
+                        "use /scene/objects for your own objects"}), 409
     robot.remove_box()
     return jsonify({"status": "success",'msg': "box removed"}), 200
 

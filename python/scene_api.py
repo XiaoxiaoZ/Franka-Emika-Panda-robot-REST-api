@@ -109,7 +109,23 @@ def models_delete(name):
 @bp.route("/scene/objects", methods=["GET"])
 def objects_list():
     """Everything in the planning scene: our model instances (with model,
-    pose, source, attached_link) plus built-ins (walls, ceiling, floor)."""
+    pose, source, attached_link) plus built-ins (walls, ceiling, floor).
+    With namespace=<ns> and/or geometry=1 the v2 format is returned instead:
+    {scene_version, objects:[{id, namespace, frame_id, pose:{position,
+    orientation}, attached_link, meta, shapes (geometry=1)}]}, covering
+    /scene/batch objects, legacy objects and builtins."""
+    if "namespace" in request.args or "geometry" in request.args:
+        import scene_v2_api
+        core = scene_v2_api.core()
+        ns = request.args.get("namespace") or None
+        geometry = request.args.get("geometry", "0") not in ("0", "false", "")
+        try:
+            world = _manager.psi.get_known_object_names()
+        except Exception:
+            world = None
+        with core._lock:
+            return jsonify({"scene_version": core.version,
+                            "objects": core.list_objects(ns, geometry, world_names=world)}), 200
     return jsonify({"objects": _manager.list_objects()}), 200
 
 

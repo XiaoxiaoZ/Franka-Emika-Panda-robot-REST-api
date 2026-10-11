@@ -582,7 +582,11 @@ class MoveGroupPythonInterfaceTutorial(object):
         from moveit_msgs.srv import GetStateValidity, GetStateValidityRequest
         rospy.wait_for_service("/check_state_validity", timeout=3.0)
         srv = rospy.ServiceProxy("/check_state_validity", GetStateValidity)
-        state = self.robot.get_current_state()      # keeps fingers + attached objects
+        state = self.robot.get_current_state()
+        # Send it as a diff: RobotCommander's state has NO attached objects and
+        # a full state would make MoveIt drop the attached bodies (wrist
+        # camera, a grasped part) from the check.
+        state.is_diff = True
         names = list(state.joint_state.name)
         pos = list(state.joint_state.position)
         for i, q in enumerate(joint_values, start=1):
@@ -1004,6 +1008,7 @@ class MoveGroupPythonInterfaceTutorial(object):
             idx = [list(cur_state.joint_state.name).index(n) for n in names]
             for k, (cost, q) in enumerate(sols[:max_collision_checks]):
                 st = copy.deepcopy(cur_state)
+                st.is_diff = True      # keep attached bodies (see check_joint_state)
                 pos = list(st.joint_state.position)
                 for i, v in zip(idx, q):
                     pos[i] = v
@@ -1044,6 +1049,7 @@ class MoveGroupPythonInterfaceTutorial(object):
                 req = GetPositionIKRequest()
                 req.ik_request.group_name = move_group.get_name()
                 st = copy.deepcopy(cur_state)
+                st.is_diff = True      # keep attached bodies (see check_joint_state)
                 pos = list(st.joint_state.position)
                 for n, v in zip(names, seed):
                     pos[list(st.joint_state.name).index(n)] = v

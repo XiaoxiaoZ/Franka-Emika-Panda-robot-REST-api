@@ -270,6 +270,70 @@ over 100° on J1..J6; `max_joint_travel_deg` to override). `dry_run=1`
 returns the planner, duration and per-joint travel without moving.
 `/control/stop` and `/control/resume` work as for the other motions.
 
+## Scene API v2 and plan-only checks (`/scene/batch`, `/plan/*`)
+
+For clients that push whole reconstructed scenes (pipeFit) and need
+plan-only checks. Nothing under `/scene/*` or `/plan/*` moves the robot or the
+gripper. Planning uses move_group's stateless services, so `/plan/*` does not
+take the motion lock.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /scene/info` | planning frame (+ transform to `panda_link0`), URDF/SRDF sha256, groups, `scene_version`, `scene_hash`, `namespace_hashes`, `dirty`, limits, shape types, wrist-camera box, hash spec |
+| `POST /scene/batch` | one namespace, `mode` replace / upsert / remove. Fully validated first (any error -> 4xx, scene untouched), then **one** PlanningScene diff, `success` checked and the scene read back; on failure the old state is re-applied, if that fails too the namespace is marked dirty (504 `apply_unconfirmed`) |
+| `GET /scene/objects?namespace=&geometry=1` | v2 listing (without these params the old format is unchanged) |
+| `DELETE /scene/namespaces/<ns>` | remove a namespace (batch and legacy objects alike); `if_version`, `force_detach` |
+| `POST /plan/check_state` | `{joints:[7] \| use_current, gripper_width_m}` -> `valid`, `contacts [{a, b, depth_m, point}]`, `joint_limit_margin_ok` |
+| `POST /plan/dry_run` | target `pose` / `joints` / `cartesian`; planner `RRTConnect` (ompl), `PTP` / `LIN` (pilz, pipeline set explicitly); returns the trajectory, duration, per-joint travel, final TCP pose, `would_be_rejected {target_near_limit, near_limit, too_large}`, and an interpolated recheck (`max_step_rad` 0.01) `trajectory_valid` + `contacts` |
+
+Objects: `{"id": "pipefit.<scene_id>.<obj>", "frame_id": "panda_link0", "pose":
+{"position": [x,y,z], "orientation": [qx,qy,qz,qw]}, "shapes": [...]}`; ids match
+`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, the namespace is everything before the last `.`
+and is hierarchical; `builtin` and `manual` are reserved. Shapes (pose relative
+to the object): `box` `size [x,y,z]`, `sphere` `radius`, `cylinder` `radius,
+length` (axis = shape z, centred), `mesh` `file` (path in `/files`), `scale`,
+optional `sha256`. Quaternions are normalised and made w >= 0; rpy is not accepted.
+Identical content returns `unchanged: true` without bumping the version;
+`if_version` gives optimistic locking; `validate_only: true` checks without committing.
+
+**Hash** (clients can verify `namespace_hash` locally):
+
+```python
+def f(v, d):                       # number -> string, no "-0.000"
+    s = "%.*f" % (d, v); return s[1:] if s.startswith("-") and float(s) == 0 else s
+def pose(p):                       # normalise quaternion, w >= 0
+    q = p["orientation"]; n = sum(x*x for x in q) ** .5; q = [x/n for x in q]
+    q = [-x for x in q] if q[3] < 0 else q
+    return {"position": [f(x, 6) for x in p["position"]], "orientation": [f(x, 9) for x in q]}
+def dims(s):
+    return {"box": s["size"], "sphere": [s["radius"]], "cylinder": [s["radius"], s["length"]],
+            "mesh": [s.get("scale", 1.0)]}[s["type"]]
+def namespace_hash(objects):       # objects as sent (with mesh sha256 filled in)
+    out = [{"id": o["id"], "frame_id": o.get("frame_id", "panda_link0"), "pose": pose(o["pose"]),
+            "attached_link": None,
+            "shapes": [{"type": s["type"], "dims": [f(x, 6) for x in dims(s)],
+                        "pose": pose(s.get("pose") or {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]}),
+                        "mesh_sha256": s["sha256"] if s["type"] == "mesh" else None} for s in o["shapes"]]}
+           for o in sorted(objects, key=lambda o: o["id"])]
+    return "sha256:" + hashlib.sha256(json.dumps(out, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+```
+
+**Safety rules**
+- *S1*: `/scene/*` and `/plan/*` never execute or touch the gripper.
+- *S2*: a commit holds the motion lock, so motion endpoints get 409 meanwhile; any `/control/*` call may pass `expect_scene_version` (409 `version_conflict` if stale).
+- *S4*: while any namespace is dirty, every `/control/*` endpoint except `/control/stop` (and `dry_run=1`) returns 409 `scene_dirty`, until a successful batch or delete on that namespace fully re-synchronises it. Dirty is tracked per namespace, so a batch elsewhere does not clear it.
+- *S5*: Flask debug/reloader is OFF by default (`FRANKA_RESTFUL_DEBUG=1` to enable): restart the server after code changes.
+- *S6*: scene state lives in `state/` (`FRANKA_STATE_DIR`), not in the `/files` store; the old `data/scene.json` is moved there once.
+- No API token (decided 2026-10-11, lab network only).
+
+**Wrist camera**: a box for the D435 + bracket is attached to `panda_hand` at
+startup (namespace `builtin`, cannot be removed through the API). The default
+size/offset is a PLACEHOLDER derived from the hand-eye calibration (TCP frame:
+size 0.045 x 0.12 x 0.05 m, centre (-0.031, -0.032, -0.047)); set
+`FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz"` once measured, or
+`FRANKA_WRIST_CAMERA=0` to disable. `/scene/info` reports `placeholder: true`
+until configured.
+
 ## File store (`/files`)
 
 A sandboxed HTTP file store on the same server, so other machines (the object

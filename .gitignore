@@ -2,3 +2,4 @@ python/handshake_server.py
 # /files store (CAD models etc.), see files_api.py
 data/
 __pycache__/
+state/

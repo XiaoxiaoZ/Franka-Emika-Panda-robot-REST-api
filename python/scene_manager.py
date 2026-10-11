@@ -27,7 +27,7 @@ import numpy as np
 from file_store import FileStoreError
 
 MESH_EXTENSIONS = (".stl", ".obj", ".dae", ".ply")
-BUILTIN_OBJECTS = ("floor", "virtual_wall_x", "virtual_wall_y", "virtual_ceiling")
+BUILTIN_OBJECTS = ("floor", "virtual_wall_x", "virtual_wall_y", "virtual_ceiling", "wrist_camera")
 COLLISION_MODES = ("mesh", "convex_hull")
 
 
@@ -178,6 +178,10 @@ class SceneManager:
         self.objects = {}                 # name -> info dict
         self._meshes = {}                 # model name -> shape_msgs/Mesh
         self._lock = threading.RLock()
+        # Hooks set by the v2 scene core (scene_core.SceneCore):
+        self.on_change = None             # called after every persisted mutation
+        self.is_reserved = None           # name -> True if a v2 batch owns that id
+        self._restoring = False
 
     # ---- persistence ----
 
@@ -187,6 +191,8 @@ class SceneManager:
         with open(tmp, "w") as f:
             json.dump({"models": self.models, "objects": self.objects}, f, indent=2, sort_keys=True)
         os.replace(tmp, self.state_file)
+        if self.on_change is not None and not self._restoring:
+            self.on_change()
 
     def restore(self):
         """Re-register models and re-add objects from scene.json. Models whose
@@ -197,6 +203,14 @@ class SceneManager:
             data = json.load(f)
         errors = []
         with self._lock:
+            self._restoring = True
+            try:
+                return self._restore_locked(data, errors)
+            finally:
+                self._restoring = False
+
+    def _restore_locked(self, data, errors):
+        if True:
             for name, info in data.get("models", {}).items():
                 try:
                     self.register_model(name, info["file"], info.get("scale", 1.0),
@@ -345,6 +359,8 @@ class SceneManager:
             raise SceneError(400, "bad_name", "name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
         if name in BUILTIN_OBJECTS:
             raise SceneError(409, "builtin", f"{name!r} is built-in safety geometry")
+        if self.is_reserved is not None and self.is_reserved(name):
+            raise SceneError(409, "namespace_owned", f"{name!r} is owned by a /scene/batch namespace")
         with self._lock:
             if name in self.objects and not overwrite:
                 raise SceneError(409, "conflict", f"object {name!r} exists")
@@ -396,9 +412,14 @@ class SceneManager:
             info = self.objects.get(name)
             if info is None:
                 raise SceneError(404, "not_found", f"no object named {name!r}")
-            info["attached_link"] = link
-            info["touch_links"] = touch_links or [link, "panda_leftfinger", "panda_rightfinger", "panda_hand_tcp"]
-            self._apply_attach(info)
+            # Only record the attachment once MoveIt accepted it; otherwise a
+            # failed call would leave the object "attached" in our state
+            # (PATCH refused, sync forever reporting it as kept_attached).
+            pending = dict(info, attached_link=link,
+                           touch_links=touch_links or [link, "panda_leftfinger", "panda_rightfinger", "panda_hand_tcp"])
+            self._apply_attach(pending)
+            info["attached_link"] = pending["attached_link"]
+            info["touch_links"] = pending["touch_links"]
             if persist:
                 self.save()
         return dict(info)
@@ -440,6 +461,20 @@ class SceneManager:
             names = [w.get("name") for w in wanted]
             if len(set(names)) != len(names):
                 raise SceneError(400, "bad_request", "duplicate object names in sync")
+            # Validate every entry before touching the scene, so a bad entry
+            # can't leave half of the set applied.
+            for i, w in enumerate(wanted):
+                name = w.get("name")
+                if not _valid_name(name):
+                    raise SceneError(400, "bad_name", f"objects[{i}].name must match [A-Za-z0-9][A-Za-z0-9._-]{{0,63}}")
+                if name in BUILTIN_OBJECTS:
+                    raise SceneError(409, "builtin", f"{name!r} is built-in safety geometry")
+                if self.is_reserved is not None and self.is_reserved(name):
+                    raise SceneError(409, "namespace_owned", f"{name!r} is owned by a /scene/batch namespace")
+                existing = self.objects.get(name)
+                if existing and existing["source"] != source:
+                    raise SceneError(409, "conflict", f"object {name!r} belongs to source {existing['source']!r}")
+                pose_from_dict(w)          # raises SceneError(400, bad_pose) on bad numbers
             result = {"added": [], "updated": [], "removed": [], "kept_attached": []}
             for w in wanted:
                 name = w.get("name")
