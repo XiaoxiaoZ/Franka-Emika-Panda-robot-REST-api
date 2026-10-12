@@ -69,6 +69,8 @@ def scene_info():
     info.update({
         "motion_enabled": True,
         "wrist_camera": _core.builtin_attached,
+        "builtin_attached": [b["id"] for b in ([_core.builtin_attached] if _core.builtin_attached else []) + _core.builtin_extra],
+        "flange_to_tcp_m": __import__("panda_ik").flange_to_tcp(),
         "acm_client_entries": len(_core.acm_entries),
         "padding": _core.padding,
         "limits": {k: v for k, v in _core.limits.items()},

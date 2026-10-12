@@ -27,7 +27,7 @@ import numpy as np
 from file_store import FileStoreError
 
 MESH_EXTENSIONS = (".stl", ".obj", ".dae", ".ply")
-BUILTIN_OBJECTS = ("floor", "virtual_wall_x", "virtual_wall_y", "virtual_ceiling", "wrist_camera")
+BUILTIN_OBJECTS = ("floor", "virtual_wall_x", "virtual_wall_y", "virtual_ceiling", "wrist_camera", "flange_adapter")
 COLLISION_MODES = ("mesh", "convex_hull")
 
 

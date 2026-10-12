@@ -120,9 +120,12 @@ check("T16", r0.get("success") and r0.get("trajectory_valid") and (r.get("succes
 
 # T17: a small box inside the camera volume (TCP frame (-0.050, -0.032, -0.047)) -> camera contact
 cur = joints_now()
-pt, qt = fk_pose(cur, "panda_hand_tcp")
-R = quaternion_matrix(qt)[:3, :3]
-spot = pt + R @ np.array(info["wrist_camera"]["center"])
+# camera geometry is given in pipeFit's nominal TCP frame: panda_link8 * Rz(-45deg) * z 0.1034
+p8, q8 = fk_pose(cur, "panda_link8")
+R8 = quaternion_matrix(q8)[:3, :3]
+c45, s45 = math.cos(-math.pi / 4), math.sin(-math.pi / 4)
+Rn = R8 @ np.array([[c45, -s45, 0], [s45, c45, 0], [0, 0, 1]])
+spot = p8 + R8 @ np.array([0, 0, 0.1034]) + Rn @ np.array(info["wrist_camera"]["center"])
 cam_blocker = {"id": "pipefit.test.camblock", "pose": {"position": list(spot), "orientation": [0, 0, 0, 1]},
                "shapes": [{"type": "box", "size": [0.008, 0.008, 0.008]}]}
 req("POST", "/scene/batch", {"namespace": "pipefit.test", "mode": "upsert", "objects": [cam_blocker]})

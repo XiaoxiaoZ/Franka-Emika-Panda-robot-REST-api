@@ -187,6 +187,7 @@ class SceneCore:
         self.batch_meta = {}                  # namespace -> last batch meta
         self.test_hooks = {"fail_next_apply": 0, "delay_next_apply_s": 0.0}
         self.builtin_attached = None          # wrist camera box, see restful.py
+        self.builtin_extra = []               # other built-in attached objects (flange adapter)
         self.acm_entries = {}                 # "a|b" -> {a, b, allowed, original}  (written by API clients)
         self.padding = None                   # {"default_m": x, "links": {link: m}}
         self.robot_links = lambda: []         # set by restful.py
@@ -1108,6 +1109,20 @@ class MoveItSceneIO:
             co.primitive_poses.append(self._pose_msg(s["pose"]))
         co.operation = CollisionObject.ADD
         return co
+
+    def attach_full(self, obj, link, touch_links, mesh_cache):
+        """Attach an object given with full geometry (v2 object dict, its
+        frame_id may be a robot link) to ``link`` in one confirmed diff."""
+        from moveit_msgs.msg import PlanningScene, AttachedCollisionObject
+        aco = AttachedCollisionObject()
+        aco.link_name = link
+        aco.touch_links = list(touch_links)
+        aco.object = self.collision_object(obj, mesh_cache)
+        ps = PlanningScene(is_diff=True)
+        ps.robot_state.is_diff = True
+        ps.robot_state.attached_collision_objects = [aco]
+        ok = bool(self._apply(ps).success)
+        return ok and obj["id"] in self.attached_names()
 
     def attach_box(self, obj_id, link, frame, size, center, touch_links):
         """Attach an axis-aligned box (pose given in ``frame``) to ``link`` in

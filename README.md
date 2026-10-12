@@ -338,12 +338,20 @@ def namespace_hash(objects):       # objects as sent (with mesh sha256 filled in
 - *S6*: scene state lives in `state/` (`FRANKA_STATE_DIR`), not in the `/files` store; the old `data/scene.json` is moved there once.
 - No API token (decided 2026-10-11, lab network only).
 
-**Wrist camera**: Intel's own D435 collision box (realsense2_description,
-25.05 x 90 x 25 mm) + 2 mm per side is attached to `panda_hand` at startup
-(namespace `builtin`, cannot be removed through the API), placed by pipeFit's
-hand-eye calibration: TCP frame size 0.029 x 0.094 x 0.029 m, centre
-(-0.031, 0.0005, -0.0435). The bracket is not modelled yet. Override with
-`FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz"` or disable with `FRANKA_WRIST_CAMERA=0`.
+**Wrist camera**: one built-in object `wrist_camera` attached to `panda_hand`
+at startup (namespace `builtin`, cannot be removed through the API), all in the
+TCP frame:
+- the D435 itself: Intel's own collision box (realsense2_description, 25.05 x 90
+  x 25 mm) + 2 mm per side, placed by pipeFit's hand-eye calibration: size
+  0.029 x 0.094 x 0.029 m, centre (-0.031, 0.0005, -0.0435);
+- its 3D-printed mount (`python/models/panda_realsense_D4xx.stl`, from
+  mvp_grasp) as a convex hull, on the hand's -x face with the wide end on the
+  camera's back, as in the photo of 2026-10-12 (see `python/models/README.md`).
+
+Mesh collision only tests surfaces: something entirely inside the mount hull is
+not reported (irrelevant in practice). Override the camera box with
+`FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz"`, drop the mount with
+`FRANKA_WRIST_MOUNT=0`, or everything with `FRANKA_WRIST_CAMERA=0`.
 
 ## File store (`/files`)
 

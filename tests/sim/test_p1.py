@@ -75,6 +75,7 @@ def box(oid, pos, size, q=(0, 0, 0, 1)):
 
 
 q_before = req("GET", "/joints")[1]["positions"]
+BUILTIN_ATTACHED = sorted(attached())          # wrist camera, flange adapter ...
 
 if PHASE == "phase1":
     req("DELETE", f"/scene/namespaces/{NS}?force_detach=1")
@@ -85,7 +86,8 @@ if PHASE == "phase1":
     # ---------------- /robot/tf, /robot/description ----------------
     st, r = req("GET", "/robot/tf?from=panda_link8&to=panda_hand_tcp")
     yaw = math.degrees(euler_from_quaternion(r["pose"]["orientation"])[2])
-    check("T21b robot/tf link8->tcp", st == 200 and np.allclose(r["pose"]["position"], [0, 0, 0.1034], atol=1e-6) and abs(yaw + 45) < 1e-4,
+    f2t = req("GET", "/scene/info")[1]["flange_to_tcp_m"]       # 0.1034 stock, 0.1234 with this robot's adapter
+    check("T21b robot/tf link8->tcp", st == 200 and np.allclose(r["pose"]["position"], [0, 0, f2t], atol=1e-6) and abs(yaw + 45) < 1e-4,
           f"xyz {np.round(r['pose']['position'], 5).tolist()} yaw {yaw:.4f} deg")
     st, r = req("GET", "/robot/description")
     check("robot/description", st == 200 and "<robot" in r["urdf"] and "<robot" in r["srdf"] and len(r["joint_limits"]) == 7
@@ -117,7 +119,8 @@ if PHASE == "phase1":
     st_del, rdel = req("DELETE", f"/scene/acm?namespace={NS}")
     _, ri = req("POST", "/plan/check_state", {"joints": HOME, "gripper_width_m": 0.02})
     acm_after, defaults_after = acm_dict()
-    diff = [(k, v, acm_after.get(k)) for k, v in acm_before.items() if CUBE not in k and acm_after.get(k) != v]
+    # self pairs (a, a) are never checked by MoveIt and are not preserved by an ACM message
+    diff = [(k, v, acm_after.get(k)) for k, v in acm_before.items() if CUBE not in k and k[0] != k[1] and acm_after.get(k) != v]
     others_same = not diff
     check("T19 ACM allow/remove", st == 200 and rv["valid"] and st_del == 200 and not ri["valid"]
           and defaults_after == defaults_before and others_same,
@@ -184,7 +187,8 @@ if PHASE == "phase1":
     v_before = req("GET", "/scene/info")[1]["scene_version"]
     acm0, _ = acm_dict()
     pre = {"type": "pose", "pose": {"position": [0.45, 0.0, 0.15], "orientation": DOWN}}
-    grasp = {"type": "pose", "pose": {"position": [0.45, 0.0, 0.03], "orientation": DOWN}}
+    # the custom fingers reach ~33 mm past the TCP (hand + 0.1034): grasp with the TCP 6 cm up
+    grasp = {"type": "pose", "pose": {"position": [0.45, 0.0, 0.06], "orientation": DOWN}}
     lift = {"type": "pose", "pose": {"position": [0.45, 0.0, 0.15], "orientation": DOWN}}
     seq = {"start": {"joints": HOME}, "gripper_width_m": 0.08, "defaults": {"velocity_scaling": 0.2},
            "steps": [{"plan": {"target": pre, "planner": "PTP"}},
@@ -203,10 +207,10 @@ if PHASE == "phase1":
     check("sequence pick", st == 200 and r["success"] and r["restored"] and len(r["steps"]) == 6,
           f"steps {kinds} {r.get('elapsed_ms')} ms {'' if r.get('success') else (last.get('error_code'), last.get('goal_contacts') or last.get('contacts'))}")
     lift_end = (r.get("steps") or [{}])[-1].get("final_tcp_pose", {}).get("position")
-    check("sequence restored scene", CUBE in world() and attached() == ["wrist_camera"] and acm1 == acm0
+    check("sequence restored scene", CUBE in world() and sorted(attached()) == BUILTIN_ATTACHED and acm1 == acm0
           and req("GET", "/scene/info")[1]["scene_version"] == v_before
           and np.allclose(objs[CUBE]["pose"]["position"], [0.45, 0.0, 0.0255]),
-          f"cube back in world, only camera attached {attached()}, ACM identical {acm1 == acm0}, version unchanged, lift ended at {np.round(lift_end, 3).tolist() if lift_end else None}")
+          f"cube back in world, only built-ins attached {sorted(attached())}, ACM identical {acm1 == acm0}, version unchanged, lift ended at {np.round(lift_end, 3).tolist() if lift_end else None}")
     # cube sunk 2 mm into the floor (inflated geometry overlaps) and no cube-floor ACM entry:
     # the attached cube is in collision with the floor -> must fail at attach (or the lift)
     seq_fail = json.loads(json.dumps(seq))
@@ -215,7 +219,7 @@ if PHASE == "phase1":
     acm0, _ = acm_dict()
     st, r = req("POST", "/plan/dry_run_sequence", seq_fail)
     check("sequence failure + restore", st == 200 and not r["success"] and r["first_failed_step"] in (4, 5) and r["restored"]
-          and CUBE in world() and attached() == ["wrist_camera"] and acm_dict()[0] == acm0,
+          and CUBE in world() and sorted(attached()) == BUILTIN_ATTACHED and acm_dict()[0] == acm0,
           f"first_failed_step {r.get('first_failed_step')} ({r['steps'][-1]['kind']}: {r['steps'][-1].get('error_code') or r['steps'][-1].get('contacts')}), restored {r.get('restored')}")
 
     # ---------------- persistence: leave state for phase 2 ----------------

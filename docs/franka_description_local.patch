@@ -1,0 +1,115 @@
+diff --git a/franka_description/robots/common/franka_hand.xacro b/franka_description/robots/common/franka_hand.xacro
+index 8b4ea71..0e47755 100644
+--- a/franka_description/robots/common/franka_hand.xacro
++++ b/franka_description/robots/common/franka_hand.xacro
+@@ -51,12 +51,27 @@
+           <box size="17.5e-3 7e-3 23.5e-3" />
+         </geometry>
+       </collision>
+-      <!-- rubber tip with which to grasp -->
+-      <collision>
+-        <origin xyz="0 7.58e-3 45.25e-3" rpy="0 0 0" />
+-        <geometry>
+-          <box size="17.5e-3 15.2e-3 18.5e-3" />
+-        </geometry>
++      <!-- LOCAL CHANGE (FrankaServer, 2026-10-12): custom fingers (bent aluminium + 3D-printed tip +
++           foam pad) instead of the stock rubber tip. Measured by the user: grasp face (foam) -> outer
++           metal 15 mm, foam 2 mm, block + foam 11 mm high, wedge tip 20 mm high narrowing from 12 mm to
++           2 mm, fingertip 67 mm below the hand body. Grasp face assumed at the stock inner face (y = 0:
++           pads meet when closed). Width 25 mm assumed. The wedge is covered by two stepped boxes.
++           Stock tip: origin 0 7.58e-3 45.25e-3, box 17.5e-3 15.2e-3 18.5e-3. -->
++      <collision>  <!-- foam + printed block + metal, 11 mm high -->
++        <origin xyz="0 7.5e-3 49.1e-3" rpy="0 0 0" />
++        <geometry><box size="25e-3 15e-3 11e-3" /></geometry>
++      </collision>
++      <collision>  <!-- wedge tip, upper half -->
++        <origin xyz="0 6e-3 59.6e-3" rpy="0 0 0" />
++        <geometry><box size="25e-3 12e-3 10e-3" /></geometry>
++      </collision>
++      <collision>  <!-- wedge tip, lower half (fingertip at 74.6 mm = 67 mm below the hand body) -->
++        <origin xyz="0 3.5e-3 69.6e-3" rpy="0 0 0" />
++        <geometry><box size="25e-3 7e-3 10e-3" /></geometry>
++      </collision>
++      <collision>  <!-- vertical metal bar above the block -->
++        <origin xyz="0 13.5e-3 34.3e-3" rpy="0 0 0" />
++        <geometry><box size="20e-3 3e-3 18.6e-3" /></geometry>
+       </collision>
+       <xacro:if value="${gazebo}">
+         <xacro:inertial_props name="leftfinger" />
+@@ -90,12 +105,27 @@
+           <box size="17.5e-3 7e-3 23.5e-3" />
+         </geometry>
+       </collision>
+-      <!-- rubber tip with which to grasp -->
+-      <collision>
+-        <origin xyz="0 -7.58e-3 45.25e-3" rpy="0 0 0" />
+-        <geometry>
+-          <box size="17.5e-3 15.2e-3 18.5e-3" />
+-        </geometry>
++      <!-- LOCAL CHANGE (FrankaServer, 2026-10-12): custom fingers (bent aluminium + 3D-printed tip +
++           foam pad) instead of the stock rubber tip. Measured by the user: grasp face (foam) -> outer
++           metal 15 mm, foam 2 mm, block + foam 11 mm high, wedge tip 20 mm high narrowing from 12 mm to
++           2 mm, fingertip 67 mm below the hand body. Grasp face assumed at the stock inner face (y = 0:
++           pads meet when closed). Width 25 mm assumed. The wedge is covered by two stepped boxes.
++           Stock tip: origin 0 -7.58e-3 45.25e-3, box 17.5e-3 15.2e-3 18.5e-3. -->
++      <collision>  <!-- foam + printed block + metal, 11 mm high -->
++        <origin xyz="0 -7.5e-3 49.1e-3" rpy="0 0 0" />
++        <geometry><box size="25e-3 15e-3 11e-3" /></geometry>
++      </collision>
++      <collision>  <!-- wedge tip, upper half -->
++        <origin xyz="0 -6e-3 59.6e-3" rpy="0 0 0" />
++        <geometry><box size="25e-3 12e-3 10e-3" /></geometry>
++      </collision>
++      <collision>  <!-- wedge tip, lower half (fingertip at 74.6 mm = 67 mm below the hand body) -->
++        <origin xyz="0 -3.5e-3 69.6e-3" rpy="0 0 0" />
++        <geometry><box size="25e-3 7e-3 10e-3" /></geometry>
++      </collision>
++      <collision>  <!-- vertical metal bar above the block -->
++        <origin xyz="0 -13.5e-3 34.3e-3" rpy="0 0 0" />
++        <geometry><box size="20e-3 3e-3 18.6e-3" /></geometry>
+       </collision>
+       <xacro:if value="${gazebo}">
+         <xacro:inertial_props name="rightfinger" />
+diff --git a/franka_description/robots/common/franka_robot.xacro b/franka_description/robots/common/franka_robot.xacro
+index b78eb07..3ec39b3 100644
+--- a/franka_description/robots/common/franka_robot.xacro
++++ b/franka_description/robots/common/franka_robot.xacro
+@@ -1,6 +1,6 @@
+ <?xml version='1.0' encoding='utf-8'?>
+ <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+-  <xacro:macro name="franka_robot" params="arm_id joint_limits parent:='world' xyz:='0 0 0' rpy:='0 0 0' hand:=false gazebo:=false tcp_xyz:='0 0 0.1034' tcp_rpy='0 0 0'">
++  <xacro:macro name="franka_robot" params="arm_id joint_limits parent:='world' xyz:='0 0 0' rpy:='0 0 0' hand:=false gazebo:=false tcp_xyz:='0 0 0.1034' tcp_rpy='0 0 0' hand_xyz:='0 0 0'">
+ 
+     <xacro:include filename="$(find franka_description)/robots/common/utils.xacro" />
+     <xacro:include filename="$(find franka_description)/robots/common/franka_arm.xacro" />
+@@ -12,6 +12,7 @@
+       <xacro:franka_hand
+           arm_id="${arm_id}"
+           rpy="0 0 ${-pi/4}"
++          xyz="${hand_xyz}"
+           tcp_xyz="${tcp_xyz}"
+           tcp_rpy="${tcp_rpy}"
+           connected_to="${arm_id}_link8"
+diff --git a/franka_description/robots/panda/panda.urdf.xacro b/franka_description/robots/panda/panda.urdf.xacro
+index 0493917..d3c317f 100644
+--- a/franka_description/robots/panda/panda.urdf.xacro
++++ b/franka_description/robots/panda/panda.urdf.xacro
+@@ -12,6 +12,10 @@
+   <xacro:arg name="tcp_xyz" default="0 0 0.1034" />
+   <!-- Rotational offset between $(arm_id)_hand -> $(arm_id)_hand_tcp [rad]. Only used when hand:=true -->
+   <xacro:arg name="tcp_rpy" default="0 0 0" />
++  <!-- Positional offset between $(arm_id)_link8 (flange) -> $(arm_id)_hand [m]. Only used when hand:=true.
++       LOCAL CHANGE (FrankaServer, 2026-10-12): this robot has a 20 mm adapter between the flange and
++       the Franka hand, so the hand (and its TCP) sit 0.02 m lower than on a stock Panda. -->
++  <xacro:arg name="hand_xyz" default="0 0 0.02" />
+ 
+   <!-- Is the robot being simulated in gazebo?" -->
+   <xacro:arg name="gazebo" default="false" />
+@@ -27,6 +31,7 @@
+                       hand="$(arg hand)"
+                       tcp_xyz="$(arg tcp_xyz)"
+                       tcp_rpy="$(arg tcp_rpy)"
++                      hand_xyz="$(arg hand_xyz)"
+                       gazebo="$(arg gazebo)"
+                       parent="$(arg parent)"
+                       xyz="$(arg xyz)"

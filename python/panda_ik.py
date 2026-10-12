@@ -10,7 +10,7 @@ taking whatever a numerical solver drifts to (KDL routinely parks q7 on its
 +-2.8973 limit).
 
 All poses are 4x4 homogeneous matrices of the Franka EE frame (flange +
-0.1034 m along z, rotated -45 deg about z -- ``panda_EE`` / ``panda_hand_tcp``
+0.1034 m along z (stock hand; see set_flange_to_tcp), rotated -45 deg about z -- ``panda_EE`` / ``panda_hand_tcp``
 in the URDF) expressed in ``panda_link0``.
 """
 import math
@@ -21,6 +21,22 @@ Q_MAX = np.array([ 2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973]
 
 # Link geometry (m) and derived constants, from the paper / reference code.
 _D1, _D3, _D5, _D7E, _A4, _A7 = 0.3330, 0.3160, 0.3840, 0.2104, 0.0825, 0.0880
+_D7 = 0.107                 # joint-7 axis to flange (panda_link8)
+_FLANGE_TO_TCP = 0.1034     # flange -> TCP along z; stock hand. See set_flange_to_tcp().
+
+
+def set_flange_to_tcp(z):
+    """Use a different flange -> TCP distance (metres), e.g. when an adapter
+    lowers the hand. Read it from the URDF (panda_hand_joint z + panda_hand
+    _tcp_joint z) rather than hard-coding it. The -45 deg rotation about z
+    is assumed unchanged."""
+    global _D7E, _FLANGE_TO_TCP
+    _FLANGE_TO_TCP = float(z)
+    _D7E = _D7 + _FLANGE_TO_TCP
+
+
+def flange_to_tcp():
+    return _FLANGE_TO_TCP
 _LL24, _LL46 = 0.10666225, 0.15426225
 _L24, _L46 = 0.326591870689, 0.392762332715
 _THETA_H46, _THETA_342, _THETA_46H = 1.35916951803, 1.31542071191, 0.211626808903
@@ -169,7 +185,7 @@ def fk(q):
                           [st * sa, ct * sa, ca, d * ca],
                           [0, 0, 0, 1]])
     c, s = math.cos(-math.pi / 4), math.sin(-math.pi / 4)
-    T_8_EE = np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0.1034], [0, 0, 0, 1]])
+    T_8_EE = np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, _FLANGE_TO_TCP], [0, 0, 0, 1]])
     return T @ T_8_EE
 
 

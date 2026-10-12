@@ -162,34 +162,112 @@ def _robot_info():
     return info
 
 
+# The analytic IK must use the same flange -> TCP distance as the URDF (this
+# robot's hand sits on a 20 mm adapter): read it instead of assuming 0.1034.
+def _flange_to_tcp_from_urdf():
+    import xml.etree.ElementTree as ET
+    u = ET.fromstring(rospy.get_param("/robot_description"))
+    z = 0.0
+    for j in u.findall("joint"):
+        if j.get("name") in ("panda_hand_joint", "panda_hand_tcp_joint"):
+            o = j.find("origin")
+            xyz = [float(v) for v in (o.get("xyz") if o is not None else "0 0 0").split()]
+            z += xyz[2]
+    return z
+
+
+try:
+    import panda_ik
+    panda_ik.set_flange_to_tcp(_flange_to_tcp_from_urdf())
+    rospy.loginfo("analytic IK: flange -> TCP = %.4f m (from URDF)", panda_ik.flange_to_tcp())
+except Exception as _e:
+    rospy.logerr("could not read flange -> TCP from the URDF (%s); analytic IK keeps %.4f", _e,
+                 __import__("panda_ik").flange_to_tcp())
+
 scene_v2_api.init(scene_core, moveit_lock, _robot_info)
 plan_api.init(robot, scene_core, moveit_lock)
 robot_api.init(robot)
 
-# Wrist camera (Intel RealSense D435) as a box attached to the hand, so
-# plan-only checks represent the real robot. Geometry = Intel's own D435
-# collision box (realsense2_description _d435.urdf.xacro: 25.05 x 90 x 25 mm,
-# centred (-0.0085, -0.0175, 0) in camera_link) + 2 mm margin per side,
-# placed with pipeFit's hand-eye calibration: colour optical centre at TCP
-# (-0.031, -0.032, -0.035), optical axis = TCP +z, image x = TCP +y. The
-# bracket is NOT modelled yet. Override with FRANKA_WRIST_CAMERA_BOX=
-# "sx,sy,sz,cx,cy,cz" (TCP frame, m), disable with FRANKA_WRIST_CAMERA=0.
+# Wrist camera (Intel RealSense D435 + its 3D-printed mount) attached to the
+# hand, so plan-only checks represent the real robot. Geometry is given in
+# pipeFit's NOMINAL TCP frame = panda_link8 * Rz(-45 deg) * z 0.1034 -- the
+# frame the hand-eye calibration was made in -- and anchored to the flange, so
+# it stays right regardless of the hand adapter (the URDF TCP is 20 mm lower):
+# - camera: Intel's own D435 collision box (realsense2_description,
+#   25.05 x 90 x 25 mm) + 2 mm per side, placed with pipeFit's hand-eye
+#   calibration (colour optical centre (-0.031, -0.032, -0.035), optical axis
+#   = TCP +z, image x = TCP +y) -> centre (-0.031, 0.0005, -0.0435);
+# - mount: models/panda_realsense_D4xx.stl (mvp_grasp), convex hull, mm->m,
+#   rotated Rz(+90 deg) (mount x -> TCP y, flat side y=0 on the hand face,
+#   mount z -> TCP +z) with its wide end on the camera's back (TCP z -0.056),
+#   as in the photo of 2026-10-12.
+# Override the camera box with FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz",
+# drop the mount with FRANKA_WRIST_MOUNT=0, everything with FRANKA_WRIST_CAMERA=0.
 _CAM_DEFAULT = (0.029, 0.094, 0.029, -0.031, 0.0005, -0.0435)
+_MOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "panda_realsense_D4xx.stl")
+_MOUNT_POSE = {"position": [-0.0185, 0.0005, -0.094], "orientation": [0.0, 0.0, 0.7071067811865476, 0.7071067811865476]}
 if os.environ.get("FRANKA_WRIST_CAMERA", "1") != "0":
+    import hashlib as _hashlib
+    import numpy as _np
+    from scene_manager import _parse_mesh_isolated
     _cam_env = os.environ.get("FRANKA_WRIST_CAMERA_BOX")
     _cam = tuple(float(v) for v in _cam_env.split(",")) if _cam_env else _CAM_DEFAULT
-    _cam_spec = {"id": "wrist_camera", "link": "panda_hand", "frame": "panda_hand_tcp",
+    _shapes = [{"type": "box", "size": list(_cam[:3]),
+                "pose": {"position": list(_cam[3:6]), "orientation": [0, 0, 0, 1]}}]
+    _mount = False
+    if os.environ.get("FRANKA_WRIST_MOUNT", "1") != "0" and os.path.isfile(_MOUNT_FILE):
+        try:
+            from scipy.spatial import ConvexHull
+            _v, _f = _parse_mesh_isolated(_MOUNT_FILE)
+            _v = _v * 0.001
+            _h = ConvexHull(_v)
+            _used = _np.unique(_h.simplices)
+            _remap = {o: n for n, o in enumerate(_used)}
+            _sha = "builtin-mount-" + _hashlib.sha256(open(_MOUNT_FILE, "rb").read()).hexdigest()[:16]
+            scene_core._mesh_cache[_sha] = (_v[_used], _np.vectorize(_remap.get)(_h.simplices))
+            _shapes.append({"type": "mesh", "sha256": _sha, "scale": 1.0, "file": "models/panda_realsense_D4xx.stl",
+                            "pose": _MOUNT_POSE})
+            _mount = True
+        except Exception as _e:
+            rospy.logerr("wrist camera mount mesh not loaded (%s); camera box only", _e)
+    _NOMINAL_TCP = {"position": [0.0, 0.0, 0.1034], "orientation": [0.0, 0.0, -0.3826834323650898, 0.9238795325112867]}
+    _cam_obj = {"id": "wrist_camera", "frame_id": "panda_link8", "pose": _NOMINAL_TCP, "shapes": _shapes}
+    _cam_spec = {"id": "wrist_camera", "link": "panda_hand",
+                 "frame": "pipeFit nominal TCP = panda_link8 * Rz(-45deg) * z 0.1034",
                  "size": list(_cam[:3]), "center": list(_cam[3:6]), "placeholder": False,
                  "source": "FRANKA_WRIST_CAMERA_BOX" if _cam_env else
                            "Intel D435 collision box (+2 mm) placed by pipeFit hand-eye calibration",
-                 "bracket_modelled": False,
+                 "bracket_modelled": _mount,
+                 "mount": {"file": "models/panda_realsense_D4xx.stl", "convex_hull": True, "pose": _MOUNT_POSE} if _mount else None,
                  "touch_links": ["panda_hand", "panda_leftfinger", "panda_rightfinger", "panda_link7"]}
-    if scene_core.io.attach_box(_cam_spec["id"], _cam_spec["link"], _cam_spec["frame"], _cam_spec["size"],
-                                _cam_spec["center"], _cam_spec["touch_links"]):
+    if scene_core.io.attach_full(_cam_obj, _cam_spec["link"], _cam_spec["touch_links"], scene_core._mesh_cache):
         scene_core.builtin_attached = _cam_spec
-        rospy.loginfo("wrist camera collision box attached (%s)", _cam_spec["source"])
+        rospy.loginfo("wrist camera attached (%s%s)", _cam_spec["source"], " + mount" if _mount else "")
     else:
         rospy.logerr("wrist camera collision box could NOT be attached")
+
+# The 20 mm adapter between the flange and the hand (the URDF moves the hand
+# down by panda_hand_joint z; this is the adapter's own volume). Diameter is
+# an ESTIMATE (80 mm); override with FRANKA_FLANGE_ADAPTER="radius,length" (m),
+# disable with FRANKA_FLANGE_ADAPTER=0.
+_ad_env = os.environ.get("FRANKA_FLANGE_ADAPTER", "")
+if _ad_env != "0":
+    try:
+        _hand_z = _flange_to_tcp_from_urdf() - 0.1034
+    except Exception:
+        _hand_z = 0.0
+    _ad_r, _ad_l = (tuple(float(v) for v in _ad_env.split(",")) if _ad_env else (0.04, _hand_z))
+    if _ad_l > 1e-4:
+        _ad_obj = {"id": "flange_adapter", "frame_id": "panda_link8",
+                   "pose": {"position": [0, 0, _ad_l / 2], "orientation": [0, 0, 0, 1]},
+                   "shapes": [{"type": "cylinder", "radius": _ad_r, "length": _ad_l,
+                               "pose": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]}}]}
+        if scene_core.io.attach_full(_ad_obj, "panda_hand", ["panda_hand", "panda_link7"], scene_core._mesh_cache):
+            scene_core.builtin_extra.append({"id": "flange_adapter", "link": "panda_hand", "frame": "panda_link8",
+                                             "radius": _ad_r, "length": _ad_l, "estimated_radius": not _ad_env})
+            rospy.loginfo("flange adapter attached (r=%.3f, l=%.3f)", _ad_r, _ad_l)
+        else:
+            rospy.logerr("flange adapter could NOT be attached")
 
 
 # Safety gate for every motion endpoint (rules S2 + S4): refuse while the
