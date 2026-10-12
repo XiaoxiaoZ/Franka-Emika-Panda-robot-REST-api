@@ -188,6 +188,8 @@ class SceneCore:
         self.test_hooks = {"fail_next_apply": 0, "delay_next_apply_s": 0.0}
         self.builtin_attached = None          # wrist camera box, see restful.py
         self.builtin_extra = []               # other built-in attached objects (flange adapter)
+        self._recent_files = {}               # relpath -> last time a batch resolved it (cleanup protection)
+        self.builtin_colors = {}              # id -> rgba for built-ins (walls, ceiling), see restful.py
         self.acm_entries = {}                 # "a|b" -> {a, b, allowed, original}  (written by API clients)
         self.padding = None                   # {"default_m": x, "links": {link: m}}
         self.robot_links = lambda: []         # set by restful.py
@@ -256,8 +258,11 @@ class SceneCore:
                 acm = self._acm_msg_with(self.acm_entries) if self.acm_entries else None
                 pad = self._padding_map(self.padding) if self.padding else None
                 attached = {oid for oid, o in self.objects.items() if o.get("attached_link")}
+                cols = {oid: o["color"] for oid, o in self.objects.items() if o.get("color")}
                 self._apply_and_confirm(ops, expect_present=set(self.objects) - attached, expect_absent=set(),
                                         acm=acm, padding=pad, expect_attached=attached)
+                if not self._ensure_colors():
+                    self.log("restore: object colours could not be confirmed (cosmetic)")
             except SceneError as e:
                 self._mark_dirty(f"restore failed: {e.msg}",
                                  {oid.rsplit(".", 1)[0] for oid in self.objects})
@@ -303,6 +308,7 @@ class SceneCore:
             while self._mesh_cache_tris > 3_000_000 and len(self._mesh_cache) > 1:
                 old = next(iter(self._mesh_cache))
                 self._mesh_cache_tris -= len(self._mesh_cache.pop(old)[1])
+        self._recent_files[self.store.relpath(abs_path)] = time.time()
         tris = len(self._mesh_cache[sha][1])
         if tris > self.limits["max_triangles_per_mesh"]:
             raise _err(422, "limits_exceeded",
@@ -410,6 +416,12 @@ class SceneCore:
             ometa = o.get("meta")
             if ometa is not None and _json_size(ometa) > self.limits["max_object_meta_bytes"]:
                 raise _err(413, "too_large", f"meta exceeds {self.limits['max_object_meta_bytes']} bytes", f"{p}.meta")
+            color = o.get("color")
+            if color is not None:
+                if (not isinstance(color, list) or len(color) not in (3, 4)
+                        or any(isinstance(c, bool) or not isinstance(c, (int, float)) or not (0.0 <= c <= 1.0) for c in color)):
+                    raise _err(400, "bad_request", "color must be [r, g, b] or [r, g, b, a] with values 0..1", f"{p}.color")
+                color = [float(c) for c in color] + ([1.0] if len(color) == 3 else [])
             req["objects"][oid] = {
                 "id": oid,
                 "frame_id": self._check_frame(o.get("frame_id"), f"{p}.frame_id"),
@@ -417,6 +429,7 @@ class SceneCore:
                 "shapes": [self._canon_shape(s, f"{p}.shapes[{j}]") for j, s in enumerate(shapes)],
                 "attached_link": None,
                 "meta": ometa,
+                "color": color,
             }
         return req
 
@@ -476,7 +489,7 @@ class SceneCore:
     # ---- commit ----
 
     def _apply_and_confirm(self, ops, expect_present, expect_absent, acm=None, padding=None,
-                           expect_attached=frozenset(), expect_detached=frozenset()):
+                           expect_attached=frozenset(), expect_detached=frozenset(), colors=None):
         """Send ops as one diff, check success and read back world names (and
         attached names). Raises SceneError(504, apply_unconfirmed)."""
         delay = self.test_hooks.get("delay_next_apply_s") or 0.0
@@ -486,7 +499,7 @@ class SceneCore:
         if self.test_hooks.get("fail_next_apply"):
             self.test_hooks["fail_next_apply"] -= 1
             raise _err(504, "apply_unconfirmed", "apply_planning_scene returned success=false (test hook)")
-        ok = self.io.apply(ops, self._mesh_cache, acm=acm, padding=padding)
+        ok = self.io.apply(ops, self._mesh_cache, acm=acm, padding=padding, colors=colors)
         if not ok:
             raise _err(504, "apply_unconfirmed", "apply_planning_scene returned success=false")
         world = set(self.io.world_names())
@@ -499,6 +512,74 @@ class SceneCore:
         if missing or lingering:
             raise _err(504, "apply_unconfirmed", "planning scene does not match after apply",
                        missing=missing[:20], lingering=lingering[:20])
+        if any(op in ("attach", "detach") for op, _, _ in ops):
+            self.reapply_colors()                                   # MoveIt dropped them all
+        else:
+            readded = [oid for op, oid, _ in ops if op == "add"]
+            if readded:
+                self.reapply_colors(readded)
+
+    def _colors_match(self, want, got):
+        return all(k in got and all(abs(a - b) <= 1e-3 for a, b in zip(got[k], v)) for k, v in want.items())
+
+    def _ensure_colors(self, colors=None):
+        """Send the complete colour table (``colors`` merged on top) in one diff.
+
+        MoveIt 1 quirks this works around: a diff with object_colors REPLACES
+        the whole colour table, and the planning-scene monitor drops colours
+        from its own scene a moment later (they are not carried over when it
+        folds diffs into its base scene) -- but it publishes them to RViz
+        first, and RViz keeps them. So colours are display-only: they cannot
+        be confirmed by reading /get_planning_scene back. The colour keeper
+        re-sends the table periodically (RViz restarts, attach/detach)."""
+        want = self.all_colors()
+        if colors:
+            want.update(colors)
+        if not want:
+            return True
+        try:
+            return bool(self.io.apply([], self._mesh_cache, colors=want))
+        except Exception as e:
+            self.log("sending object colours failed: %s", e)
+            return False
+
+    def all_colors(self):
+        cols = {oid: o["color"] for oid, o in self.objects.items() if o.get("color")}
+        cols.update(self.builtin_colors)
+        return cols
+
+    def reapply_colors(self, ids=None):
+        """Re-send the complete colour table (MoveIt drops colours on attached-
+        object changes and on REMOVE; any colour diff replaces the whole table).
+        ``ids`` is accepted for call sites that only re-added a few objects."""
+        if self.all_colors() and not self._ensure_colors():
+            self.log("object colours could not be confirmed (cosmetic)")
+
+    def start_color_keeper(self, interval_s=2.0):
+        """Re-send the complete colour table every ``interval_s`` (see
+        _ensure_colors for why colours cannot simply be set once). Keeps RViz
+        right after RViz restarts and attached-object changes. Never blocks
+        scene operations (skips a tick if busy)."""
+        if getattr(self, "_color_keeper", None):
+            return
+
+        def loop():
+            while True:
+                time.sleep(interval_s)
+                if not self._lock.acquire(blocking=False):
+                    continue
+                try:
+                    want = self.all_colors()
+                    if want:
+                        self.io.apply([], self._mesh_cache, colors=want)    # always the full table
+                except Exception as e:
+                    self.log("colour keeper: %s", e)
+                finally:
+                    self._lock.release()
+
+        self._color_keeper = threading.Thread(target=loop, name="color-keeper", daemon=True)
+        self._color_keeper.start()
+        self.log("colour keeper started (every %.1f s)", interval_s)
 
     def _rollback(self, before, touched, acm_before=None):
         """Re-apply the pre-batch state of every touched id (and the ACM,
@@ -583,6 +664,9 @@ class SceneCore:
                          and hash_object(target[oid]) != hash_object(current[oid]))
         meta_only = [oid for oid in target if oid in current and oid not in updated
                      and target[oid].get("meta") != current[oid].get("meta")]
+        # colour is cosmetic (RViz): not part of the hash, no version bump on its own
+        color_only = [oid for oid in target if oid in current and oid not in updated
+                      and target[oid].get("color") != current[oid].get("color")]
         world = set() if dry else set(self.io.world_names())
         resync = self._is_dirty(ns)
         if resync:
@@ -608,11 +692,17 @@ class SceneCore:
                           apply_ms=int((time.time() - t0) * 1000))
             return result
         if not changed:
+            if color_only:
+                for oid in color_only:
+                    self.objects[oid]["color"] = target[oid].get("color")
+                if not self._ensure_colors():
+                    warnings.append("colour update could not be confirmed in move_group")
+                result["recolored"] = sorted(color_only)
             for oid in meta_only:
                 self.objects[oid]["meta"] = target[oid].get("meta")
             if req["meta"] is not None:
                 self.batch_meta[ns] = req["meta"]
-            if meta_only or req["meta"] is not None:
+            if meta_only or color_only or req["meta"] is not None:
                 self.save()
             result.update(unchanged=True, confirmed=True, scene_version=self.version,
                           scene_hash=self.scene_hash(), apply_ms=int((time.time() - t0) * 1000))
@@ -623,7 +713,11 @@ class SceneCore:
         before = copy.deepcopy(current)
         acm_msg, acm_drop = self._acm_for_removed(set(removed))
         acm_before = self.io.get_acm() if acm_msg is not None else None
+        colors = {oid: target[oid]["color"] for oid in set(added) | set(updated) | set(missing) | set(color_only)
+                  if target[oid].get("color")}
         try:
+            # colours go in their own diff after the geometry: within one diff MoveIt
+            # applies colours first and a REMOVE then clears the object's colour
             self._apply_and_confirm(ops, expect_present=set(added) | set(updated) | set(missing),
                                     expect_absent=set(removed), acm=acm_msg)
         except SceneError as e:
@@ -642,6 +736,8 @@ class SceneCore:
             self.objects[oid] = target[oid]
         for k in acm_drop:
             self.acm_entries.pop(k, None)
+        if (colors or self.builtin_colors) and not self._ensure_colors():
+            warnings.append("colours could not be confirmed in move_group")
         if req["meta"] is not None:
             self.batch_meta[ns] = req["meta"]
         self.version += 1
@@ -987,6 +1083,78 @@ class SceneCore:
     def io_detach_existing(self, oid, link):
         self._apply_and_confirm([("detach", oid, {"link": link})], {oid}, set(), expect_detached={oid})
 
+    # ---- unreferenced files / cleanup ----
+
+    def referenced_files(self):
+        refs = {s["file"] for o in self.objects.values() for s in o["shapes"] if s["type"] == "mesh" and s.get("file")}
+        if self.legacy is not None:
+            refs |= {m.get("file") for m in self.legacy.models.values() if m.get("file")}
+        return refs
+
+    def unreferenced(self, prefix="pipefit/meshes", older_than_s=600.0):
+        """Files under ``prefix`` in the /files store that no object or model
+        references. Files modified or used by a batch within ``older_than_s``
+        are listed but marked protected (a batch may be about to use them)."""
+        from file_store import FileStoreError
+        try:
+            root = self.store.resolve(prefix)
+        except FileStoreError as e:
+            raise _err(400, "bad_request", e.msg, "prefix")
+        if not os.path.isdir(root):
+            return []
+        refs = self.referenced_files()
+        now = time.time()
+        out = []
+        for dirpath, _dirs, files in os.walk(root):
+            for name in sorted(files):
+                if name.startswith("."):
+                    continue
+                ap = os.path.join(dirpath, name)
+                rel = self.store.relpath(ap)
+                if rel in refs:
+                    continue
+                st = os.stat(ap)
+                last = max(st.st_mtime, self._recent_files.get(rel, 0.0))
+                out.append({"path": rel, "size": st.st_size, "age_s": round(now - last, 1),
+                            "protected": (now - last) < older_than_s})
+        return out
+
+    def cleanup(self, prefix="pipefit/meshes", older_than_s=600.0, dry_run=True, models=False):
+        """Delete unreferenced, unprotected files under ``prefix`` (and, with
+        models=True, legacy /scene/models that no object uses). dry_run=True
+        only reports."""
+        with self._lock:
+            files = self.unreferenced(prefix, older_than_s)
+            victims = [f for f in files if not f["protected"]]
+            unused_models = []
+            if models and self.legacy is not None:
+                used = {o["model"] for o in self.legacy.objects.values()}
+                unused_models = sorted(n for n in self.legacy.models if n not in used)
+            result = {"dry_run": dry_run, "prefix": prefix, "older_than_s": older_than_s,
+                      "files": [f["path"] for f in victims],
+                      "protected": [f["path"] for f in files if f["protected"]],
+                      "bytes": sum(f["size"] for f in victims), "models": unused_models}
+            if dry_run:
+                return result
+            for f in victims:
+                ap = self.store.resolve(f["path"])
+                try:
+                    sha = self.store.sha256(ap)
+                except OSError:
+                    sha = None
+                self.store.delete(ap)
+                if sha in self._mesh_cache:
+                    self._mesh_cache_tris -= len(self._mesh_cache.pop(sha)[1])
+                self._recent_files.pop(f["path"], None)
+            if unused_models:
+                hook, self.legacy.on_change = self.legacy.on_change, None   # no scene change: no version bump
+                try:
+                    for n in unused_models:
+                        self.legacy.delete_model(n)
+                finally:
+                    self.legacy.on_change = hook
+            return result
+
     # ---- snapshot ----
 
     def snapshot(self, namespace=None):
@@ -1023,7 +1191,7 @@ class SceneCore:
             if namespace and not (ns == namespace or ns.startswith(namespace + ".")):
                 continue
             item = {"id": oid, "namespace": ns, "frame_id": o["frame_id"], "pose": o["pose"],
-                    "attached_link": o.get("attached_link"), "meta": o.get("meta")}
+                    "attached_link": o.get("attached_link"), "meta": o.get("meta"), "color": o.get("color")}
             if geometry:
                 item["shapes"] = [{k: v for k, v in s.items() if k != "triangles"} for s in o["shapes"]]
             out.append(item)
@@ -1150,6 +1318,11 @@ class MoveItSceneIO:
         res = self._get(PlanningSceneComponents(components=PlanningSceneComponents.ALLOWED_COLLISION_MATRIX))
         return res.scene.allowed_collision_matrix
 
+    def get_colors(self):
+        from moveit_msgs.msg import PlanningSceneComponents
+        res = self._get(PlanningSceneComponents(components=PlanningSceneComponents.OBJECT_COLORS))
+        return {c.id: [c.color.r, c.color.g, c.color.b, c.color.a] for c in res.scene.object_colors}
+
     def get_padding(self):
         from moveit_msgs.msg import PlanningSceneComponents
         res = self._get(PlanningSceneComponents(components=PlanningSceneComponents.LINK_PADDING_AND_SCALING))
@@ -1167,7 +1340,7 @@ class MoveItSceneIO:
                               "orientation": [p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]}
         return out
 
-    def apply(self, ops, mesh_cache, acm=None, padding=None):
+    def apply(self, ops, mesh_cache, acm=None, padding=None, colors=None):
         """One PlanningScene diff. ops: ("remove", id, None), ("add", id, obj),
         ("attach", id, {"link", "touch_links"}) -- attaches the EXISTING world
         object --, ("detach", id, {"link"}) -- puts it back into the world.
@@ -1181,6 +1354,10 @@ class MoveItSceneIO:
             ps.allowed_collision_matrix = acm
         if padding:
             ps.link_padding = [LinkPadding(link_name=k, padding=float(v)) for k, v in sorted(padding.items())]
+        if colors:
+            from moveit_msgs.msg import ObjectColor
+            from std_msgs.msg import ColorRGBA
+            ps.object_colors = [ObjectColor(id=k, color=ColorRGBA(*v)) for k, v in sorted(colors.items())]
         for op, oid, obj in ops:
             if not oid:          # an empty id would address ALL objects
                 raise ValueError("refusing scene op with empty id")

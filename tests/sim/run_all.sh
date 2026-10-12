@@ -9,3 +9,6 @@ echo "===== plan suite (after restart)"; python3 "$HERE/test_plan_p0.py" 2>&1 | 
 echo "===== P1 phase 1"; python3 "$HERE/test_p1.py" phase1 2>&1 | grep -E "^(PASS|FAIL)|passed|Traceback|Error"
 "$HERE/restart_server.sh" >/dev/null && wait_up || exit 1
 echo "===== P1 phase 2 (after restart)"; python3 "$HERE/test_p1.py" phase2 2>&1 | grep -E "^(PASS|FAIL)|passed|Traceback|Error"
+echo "===== P2 phase 1"; python3 "$HERE/test_p2.py" phase1 2>&1 | grep -E "^(PASS|FAIL)|passed|Traceback|Error"
+"$HERE/restart_server.sh" >/dev/null && wait_up || exit 1
+echo "===== P2 phase 2 (after restart)"; python3 "$HERE/test_p2.py" phase2 2>&1 | grep -E "^(PASS|FAIL)|passed|Traceback|Error"

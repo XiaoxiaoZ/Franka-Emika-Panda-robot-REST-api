@@ -300,6 +300,9 @@ take the motion lock.
 | `GET/POST/DELETE /scene/acm` | allowed pairs; `POST {entries:[{a, b, allowed}]}` reads, merges and writes the whole ACM back, remembering each pair's original value; `DELETE ?namespace=` restores them. SRDF/default entries untouched; entries of removed objects are dropped |
 | `GET/POST /scene/padding` | robot-link padding vs world (`{default_m, links}`), persisted |
 | `GET /scene/snapshot?namespace=` | complete canonical scene (geometry, meta, client ACM entries, padding, hashes) |
+| object `color: [r, g, b, a]` in `/scene/batch` | RViz colour (0..1). Not part of the hash; a colour-only change does not bump the version. Display-only: MoveIt 1 drops colours from its own scene right after publishing them to RViz, so `/get_planning_scene` may not show them -- `GET /scene/objects` does. The API re-sends the full colour table every 2 s and after attach/detach (walls and ceiling included) |
+| `GET /scene/unreferenced?prefix=pipefit/meshes&older_than_s=600` | files in `/files` no object or model references; recently used/uploaded ones are marked protected |
+| `POST /scene/cleanup` | `{prefix, older_than_s: 600, dry_run: true, models: false}` -- deletes unreferenced, unprotected files (dry run by default) and, with `models`, legacy models no object uses |
 | `GET /robot/tf?from=&to=[&joints=]` | nominal FK between two robot links (current or given joints) |
 | `GET /robot/description` | URDF, SRDF (+ sha256), joint limits, groups, links |
 

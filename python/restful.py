@@ -246,6 +246,11 @@ if os.environ.get("FRANKA_WRIST_CAMERA", "1") != "0":
     else:
         rospy.logerr("wrist camera collision box could NOT be attached")
 
+# Built-in colours (MoveIt drops all object colours whenever attached objects
+# change, e.g. right below when the camera is attached): the API re-applies
+# them, together with the colours of /scene/batch objects.
+scene_core.builtin_colors = {n: [1.0, 0.25, 0.2, 0.35] for n in ("virtual_wall_x", "virtual_wall_y", "virtual_ceiling")}
+
 # The 20 mm adapter between the flange and the hand (the URDF moves the hand
 # down by panda_hand_joint z; this is the adapter's own volume). Diameter is
 # an ESTIMATE (80 mm); override with FRANKA_FLANGE_ADAPTER="radius,length" (m),
@@ -268,6 +273,9 @@ if _ad_env != "0":
             rospy.loginfo("flange adapter attached (r=%.3f, l=%.3f)", _ad_r, _ad_l)
         else:
             rospy.logerr("flange adapter could NOT be attached")
+
+scene_core.reapply_colors()      # attaching the built-ins above cleared every object colour
+scene_core.start_color_keeper()  # ...and MoveIt keeps dropping them in other cases: reconcile every 2 s
 
 
 # Safety gate for every motion endpoint (rules S2 + S4): refuse while the
@@ -1079,6 +1087,39 @@ def gripper_open_force_impl():
         return jsonify({"error": "Robot is busy"}), 409
     try: return gripper_open1()
     finally: moveit_lock.release()
+
+@app.route('/control/gripper_homing', methods = ['GET'])
+def gripper_homing_impl():
+    """Home the Franka gripper (franka_gripper/homing): the fingers open fully
+    and close again to re-learn their travel. Needed after restarting
+    franka_control when every gripper command fails with "Commanding out of
+    range position! max_position = -0.000001". Moves the FINGERS only (not
+    the arm); make sure nothing is between them. Returns the finger width
+    afterwards."""
+    if not moveit_lock.acquire(blocking=False):
+        return jsonify({"error": "Robot is busy"}), 409
+    try:
+        from franka_gripper.msg import HomingAction, HomingGoal
+        client = actionlib.SimpleActionClient('/franka_gripper/homing', HomingAction)
+        if not client.wait_for_server(rospy.Duration(3.0)):
+            return jsonify({"error": "homing_unavailable", "msg": "franka_gripper/homing action server not available"}), 503
+        client.send_goal(HomingGoal())
+        if not client.wait_for_result(rospy.Duration(40.0)):
+            client.cancel_goal()
+            return jsonify({"error": "timeout", "msg": "homing did not finish within 40 s"}), 504
+        res = client.get_result()
+        width = None
+        msg = _joint_state["msg"]
+        if msg is not None:
+            pos = dict(zip(msg.name, msg.position))
+            if "panda_finger_joint1" in pos and "panda_finger_joint2" in pos:
+                width = pos["panda_finger_joint1"] + pos["panda_finger_joint2"]
+        ok = bool(res and res.success)
+        return jsonify({"status": "homed" if ok else "failed", "success": ok,
+                        "error_msg": (res.error if res else "no result") or None,
+                        "gripper_width_m": width}), 200 if ok else 500
+    finally:
+        moveit_lock.release()
 
 @app.route('/control/gripper_grasp', methods = ['GET'])
 def gripper_grasp_impl():

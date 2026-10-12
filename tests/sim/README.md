@@ -12,3 +12,4 @@ talks to the real robot's master or server.
 Scratch data (state, files, logs) goes to `$SIM_DIR` (default /tmp/franka_sim).
 `test_p1.py` covers P1 (T18 attach/detach, T19 ACM, padding, /robot/tf, /plan/ik,
 check_trajectory, dry_run_sequence, restart persistence); `p1_only.sh` runs just those.
+`test_p2.py` / `p2_only.sh`: object colours (as RViz receives them) and file cleanup.

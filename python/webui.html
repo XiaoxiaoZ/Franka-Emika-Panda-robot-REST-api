@@ -135,6 +135,8 @@
     <div class="row">
       <button onclick="gripperOpen()">Open (0.08)</button>
       <button class="ghost" onclick="gripperClose()">Close (0.005)</button>
+      <button class="ghost" title="re-learn the finger travel; needed after restarting franka_control when gripper commands fail with 'out of range position'. Fingers open fully and close."
+              onclick="if (confirm('Home the gripper? The fingers open fully and close again. Make sure nothing is between them.')) motion('/control/gripper_homing', 'gripper homing', 60000)">Homing</button>
     </div>
     <div class="row">
       <label>Force (N)</label><input id="gforce" type="number" value="20" step="1" min="1" max="70">

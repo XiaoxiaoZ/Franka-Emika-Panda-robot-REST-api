@@ -189,6 +189,37 @@ def scene_padding_post():
                                      if_version=d.get("if_version"))), 200
 
 
+@bp.route("/scene/unreferenced", methods=["GET"])
+def scene_unreferenced():
+    """Files under prefix= (default pipefit/meshes) in the /files store that no
+    scene object or model references, with size and age; files used or
+    modified within older_than_s= (default 600) are marked protected."""
+    try:
+        older = float(request.args.get("older_than_s", "600"))
+    except ValueError:
+        raise SceneError(400, "bad_request", "older_than_s must be a number")
+    files = _core.unreferenced(request.args.get("prefix", "pipefit/meshes"), older)
+    return jsonify({"files": files, "count": len(files), "bytes": sum(f["size"] for f in files)}), 200
+
+
+@bp.route("/scene/cleanup", methods=["POST"])
+def scene_cleanup():
+    """Delete unreferenced mesh files (and optionally unused legacy models).
+    JSON: prefix (pipefit/meshes), older_than_s (600: recently uploaded or
+    used files are kept), dry_run (TRUE by default -- set false to delete),
+    models (false). Never touches referenced files or the scene itself."""
+    d = _json_body() or {}
+    if not isinstance(d, dict):
+        raise SceneError(400, "bad_request", "body must be a JSON object")
+    try:
+        older = float(d.get("older_than_s", 600))
+    except (TypeError, ValueError):
+        raise SceneError(400, "bad_request", "older_than_s must be a number")
+    return jsonify(_core.cleanup(d.get("prefix", "pipefit/meshes"), older,
+                                 dry_run=d.get("dry_run", True) is not False,
+                                 models=bool(d.get("models", False)))), 200
+
+
 @bp.route("/scene/snapshot", methods=["GET"])
 def scene_snapshot():
     """Canonical, complete scene for reproduction: every object with full
