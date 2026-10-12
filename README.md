@@ -270,6 +270,14 @@ over 100° on J1..J6; `max_joint_travel_deg` to override). `dry_run=1`
 returns the planner, duration and per-joint travel without moving.
 `/control/stop` and `/control/resume` work as for the other motions.
 
+## This robot's tool (read first)
+
+This Panda has a 20 mm flange adapter, custom fingers and a wrist RealSense D435,
+all modelled in the URDF / planning scene since 2026-10-12. The TCP the API
+uses is flange + 0.1234 m (stock: 0.1034), i.e. the same TCP target now puts
+the hand 2 cm higher than before. See [`docs/robot_setup.md`](docs/robot_setup.md)
+for frames, dimensions, the collision model and what clients must adjust.
+
 ## Scene API v2 and plan-only checks (`/scene/batch`, `/plan/*`)
 
 For clients that push whole reconstructed scenes (pipeFit) and need
