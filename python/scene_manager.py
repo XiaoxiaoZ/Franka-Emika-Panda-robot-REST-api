@@ -180,6 +180,8 @@ class SceneManager:
         self._lock = threading.RLock()
         # Hooks set by the v2 scene core (scene_core.SceneCore):
         self.on_change = None             # called after every persisted mutation
+        self.attach_fn = None             # (name, link, touch_links) -> None, raises SceneError
+        self.detach_fn = None             # (name, link) -> None, raises SceneError
         self.is_reserved = None           # name -> True if a v2 batch owns that id
         self._restoring = False
 
@@ -321,6 +323,10 @@ class SceneManager:
         self.psi.add_object(co)
 
     def _apply_attach(self, info):
+        if self.attach_fn is not None:     # one confirmed diff, MoveIt-version independent
+            self.attach_fn(info["name"], info["attached_link"],
+                           info.get("touch_links") or [info["attached_link"]])
+            return
         from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
         aco = AttachedCollisionObject()
         aco.link_name = info["attached_link"]
@@ -432,7 +438,10 @@ class SceneManager:
             if info.get("attached_link"):
                 # MoveIt puts a detached object back into the world where the
                 # gripper left it; record that pose instead of the old one.
-                self.psi.remove_attached_object(info["attached_link"], name)
+                if self.detach_fn is not None:
+                    self.detach_fn(name, info["attached_link"])
+                else:
+                    self.psi.remove_attached_object(info["attached_link"], name)
                 info["attached_link"] = None
                 info.pop("touch_links", None)
                 try:

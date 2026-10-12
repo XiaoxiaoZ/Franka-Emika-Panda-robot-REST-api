@@ -187,6 +187,9 @@ class SceneCore:
         self.batch_meta = {}                  # namespace -> last batch meta
         self.test_hooks = {"fail_next_apply": 0, "delay_next_apply_s": 0.0}
         self.builtin_attached = None          # wrist camera box, see restful.py
+        self.acm_entries = {}                 # "a|b" -> {a, b, allowed, original}  (written by API clients)
+        self.padding = None                   # {"default_m": x, "links": {link: m}}
+        self.robot_links = lambda: []         # set by restful.py
 
     @property
     def dirty(self):
@@ -208,7 +211,8 @@ class SceneCore:
 
     def _snapshot(self):
         return {"api_version": API_VERSION, "version": self.version,
-                "dirty_namespaces": sorted(self.dirty_namespaces), "dirty_reason": self.dirty_reason, "updated_at": self.updated_at,
+                "dirty_namespaces": sorted(self.dirty_namespaces), "dirty_reason": self.dirty_reason,
+                "acm_entries": self.acm_entries, "padding": self.padding, "updated_at": self.updated_at,
                 "objects": self.objects, "batch_meta": self.batch_meta}
 
     def save(self):
@@ -233,7 +237,9 @@ class SceneCore:
             self.batch_meta = data.get("batch_meta", {})
             self.dirty_namespaces = set(data.get("dirty_namespaces", []))
             self.dirty_reason = data.get("dirty_reason")
-            if not self.objects:
+            self.acm_entries = data.get("acm_entries", {}) or {}
+            self.padding = data.get("padding")
+            if not self.objects and not self.acm_entries and not self.padding:
                 return {"objects": 0, "restored": True, "dirty": self.dirty}
             try:
                 for o in self.objects.values():
@@ -243,7 +249,14 @@ class SceneCore:
                 world = set(self.io.world_names())
                 ops = [("remove", oid, None) for oid in self.objects if oid in world]
                 ops += [("add", oid, o) for oid, o in self.objects.items()]
-                self._apply_and_confirm(ops, expect_present=set(self.objects), expect_absent=set())
+                # attachments do not survive a move_group restart: put them back
+                ops += [("attach", oid, {"link": o["attached_link"], "touch_links": o.get("touch_links")})
+                        for oid, o in self.objects.items() if o.get("attached_link")]
+                acm = self._acm_msg_with(self.acm_entries) if self.acm_entries else None
+                pad = self._padding_map(self.padding) if self.padding else None
+                attached = {oid for oid, o in self.objects.items() if o.get("attached_link")}
+                self._apply_and_confirm(ops, expect_present=set(self.objects) - attached, expect_absent=set(),
+                                        acm=acm, padding=pad, expect_attached=attached)
             except SceneError as e:
                 self._mark_dirty(f"restore failed: {e.msg}",
                                  {oid.rsplit(".", 1)[0] for oid in self.objects})
@@ -437,7 +450,16 @@ class SceneCore:
         return hash_objects([o for oid, o in self.all_objects().items() if in_namespace(oid, ns)])
 
     def scene_hash(self):
-        return hash_objects(list(self.all_objects().values()))
+        """sha256 over {objects (hash_object list), acm: [[a, b, allowed]...]
+        sorted, padding: {default_m, links} as %.6f strings or null}."""
+        objs = [hash_object(o) for o in sorted(self.all_objects().values(), key=lambda o: o["id"])]
+        acm = sorted([e["a"], e["b"], bool(e["allowed"])] for e in self.acm_entries.values())
+        pad = None
+        if self.padding:
+            pad = {"default_m": _fmt(self.padding["default_m"], 6),
+                   "links": {k: _fmt(v, 6) for k, v in sorted(self.padding.get("links", {}).items())}}
+        raw = json.dumps({"objects": objs, "acm": acm, "padding": pad}, sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def namespaces(self):
         tops = sorted({oid.split(".", 1)[0] for oid in self.all_objects() if "." in oid})
@@ -452,9 +474,10 @@ class SceneCore:
 
     # ---- commit ----
 
-    def _apply_and_confirm(self, ops, expect_present, expect_absent):
-        """Send ops [("add"|"remove", id, obj)] as one diff, check success and
-        read back world names. Raises SceneError(504, apply_unconfirmed)."""
+    def _apply_and_confirm(self, ops, expect_present, expect_absent, acm=None, padding=None,
+                           expect_attached=frozenset(), expect_detached=frozenset()):
+        """Send ops as one diff, check success and read back world names (and
+        attached names). Raises SceneError(504, apply_unconfirmed)."""
         delay = self.test_hooks.get("delay_next_apply_s") or 0.0
         if delay:
             self.test_hooks["delay_next_apply_s"] = 0.0
@@ -462,23 +485,34 @@ class SceneCore:
         if self.test_hooks.get("fail_next_apply"):
             self.test_hooks["fail_next_apply"] -= 1
             raise _err(504, "apply_unconfirmed", "apply_planning_scene returned success=false (test hook)")
-        ok = self.io.apply(ops, self._mesh_cache)
+        ok = self.io.apply(ops, self._mesh_cache, acm=acm, padding=padding)
         if not ok:
             raise _err(504, "apply_unconfirmed", "apply_planning_scene returned success=false")
         world = set(self.io.world_names())
         missing = sorted(expect_present - world)
         lingering = sorted(expect_absent & world)
+        if expect_attached or expect_detached:
+            att = set(self.io.attached_names())
+            missing += sorted(set(expect_attached) - att)
+            lingering += sorted(set(expect_detached) & att)
         if missing or lingering:
             raise _err(504, "apply_unconfirmed", "planning scene does not match after apply",
                        missing=missing[:20], lingering=lingering[:20])
 
-    def _rollback(self, before, touched):
-        """Re-apply the pre-batch state of every touched id."""
+    def _rollback(self, before, touched, acm_before=None):
+        """Re-apply the pre-batch state of every touched id (and the ACM,
+        which MoveIt applies before the world part of a failed diff)."""
         world = set(self.io.world_names())
-        ops = [("remove", oid, None) for oid in touched if oid in world]
+        attached = set(self.io.attached_names())
+        ops = [("detach", oid, {"link": before[oid]["attached_link"]}) for oid in touched
+               if oid in attached and oid in before and before[oid].get("attached_link")]
+        ops += [("remove", oid, None) for oid in touched if oid in world or oid in attached]
         ops += [("add", oid, before[oid]) for oid in touched if oid in before]
-        present = {oid for oid in touched if oid in before}
-        self._apply_and_confirm(ops, expect_present=present, expect_absent=set(touched) - present)
+        ops += [("attach", oid, {"link": before[oid]["attached_link"], "touch_links": before[oid].get("touch_links")})
+                for oid in touched if oid in before and before[oid].get("attached_link")]
+        present = {oid for oid in touched if oid in before and not before[oid].get("attached_link")}
+        self._apply_and_confirm(ops, expect_present=present, expect_absent=set(touched) - present -
+                                {oid for oid in touched if oid in before}, acm=acm_before)
 
     def batch(self, req, motion_lock, lock_timeout_s=5.0):
         """Commit a validated request. Holds ``motion_lock`` only for the
@@ -586,12 +620,14 @@ class SceneCore:
         ops = [("remove", oid, None) for oid in sorted(set(updated) | set(removed) | set(missing)) if oid in world]
         ops += [("add", oid, target[oid]) for oid in sorted(set(added) | set(updated) | set(missing))]
         before = copy.deepcopy(current)
+        acm_msg, acm_drop = self._acm_for_removed(set(removed))
+        acm_before = self.io.get_acm() if acm_msg is not None else None
         try:
             self._apply_and_confirm(ops, expect_present=set(added) | set(updated) | set(missing),
-                                    expect_absent=set(removed))
+                                    expect_absent=set(removed), acm=acm_msg)
         except SceneError as e:
             try:
-                self._rollback(before, touched)
+                self._rollback(before, touched, acm_before)
                 e.extra["rolled_back"] = True
             except SceneError as e2:
                 self._mark_dirty(f"batch on {ns!r} failed ({e.msg}) and rollback failed ({e2.msg})", {ns})
@@ -603,6 +639,8 @@ class SceneCore:
             self.objects.pop(oid, None)
         for oid in target:
             self.objects[oid] = target[oid]
+        for k in acm_drop:
+            self.acm_entries.pop(k, None)
         if req["meta"] is not None:
             self.batch_meta[ns] = req["meta"]
         self.version += 1
@@ -633,20 +671,27 @@ class SceneCore:
                 legacy_names = set(self.legacy_objects())
                 stray = sorted(oid for oid in world if in_namespace(oid, ns)
                                and oid not in self.objects and oid not in legacy_names)
-                if ours or stray:
+                acm_msg, acm_drop = self._acm_for_removed(set(ours) | set(legacy) | set(stray))
+                if ours or stray or acm_msg is not None:
                     before = {oid: self.objects[oid] for oid in ours}
-                    ops = [("remove", oid, None) for oid in ours + stray if oid in world]
+                    acm_before = self.io.get_acm() if acm_msg is not None else None
+                    ops = [("detach", oid, {"link": self.objects[oid]["attached_link"]})
+                           for oid in ours if self.objects[oid].get("attached_link")]
+                    ops += [("remove", oid, None) for oid in ours + stray
+                            if oid in world or self.objects.get(oid, {}).get("attached_link")]
                     try:
-                        self._apply_and_confirm(ops, expect_present=set(), expect_absent=set(ours))
+                        self._apply_and_confirm(ops, expect_present=set(), expect_absent=set(ours), acm=acm_msg)
                     except SceneError as e:
                         try:
-                            self._rollback(before, ours)
+                            self._rollback(before, ours, acm_before)
                         except SceneError as e2:
                             self._mark_dirty(f"namespace delete failed ({e.msg}), rollback failed ({e2.msg})", {ns})
                         self.save()
                         raise
                     for oid in ours:
                         self.objects.pop(oid)
+                    for k in acm_drop:
+                        self.acm_entries.pop(k, None)
                 hook, self.legacy.on_change = self.legacy.on_change, None   # we bump once below
                 try:
                     for n in legacy:
@@ -666,6 +711,298 @@ class SceneCore:
                 return {"removed": removed, "scene_version": self.version, "scene_hash": self.scene_hash()}
         finally:
             motion_lock.release()
+
+    # ---- ACM ----
+
+    @staticmethod
+    def _pair_key(a, b):
+        a, b = sorted((a, b))
+        return f"{a}|{b}"
+
+    def _acm_msg_with(self, entries, drop_names=()):
+        """Current scene ACM with ``entries`` ({key: {a, b, allowed}}) written
+        over it and ``drop_names`` removed (their rows/columns)."""
+        from moveit_msgs.msg import AllowedCollisionMatrix, AllowedCollisionEntry
+        cur = self.io.get_acm()
+        names = list(cur.entry_names)
+        vals = {}
+        for i, a in enumerate(names):
+            for j, b in enumerate(names):
+                vals[(a, b)] = bool(cur.entry_values[i].enabled[j])
+        for e in entries.values():
+            for n in (e["a"], e["b"]):
+                if n not in names:
+                    names.append(n)
+            vals[(e["a"], e["b"])] = vals[(e["b"], e["a"])] = bool(e["allowed"])
+        names = [n for n in names if n not in set(drop_names)]
+        msg = AllowedCollisionMatrix()
+        msg.entry_names = names
+        # The message is dense: every pair of listed names becomes an explicit
+        # entry. A pair that was NOT explicit before must get the value MoveIt
+        # derives from the default entries (e.g. the *_sc capsules are
+        # default-allowed with everything) -- writing False there would make
+        # every new object collide with them.
+        msg.entry_values = [AllowedCollisionEntry(enabled=[vals[(a, b)] if (a, b) in vals
+                                                           else self._default_allowed(cur, a, b)
+                                                           for b in names]) for a in names]
+        msg.default_entry_names = list(cur.default_entry_names)
+        msg.default_entry_values = list(cur.default_entry_values)
+        return msg
+
+    @staticmethod
+    def _default_allowed(acm, a, b):
+        """MoveIt's fallback for a pair without an explicit entry: allowed if
+        either name has a default entry that allows everything."""
+        d = dict(zip(acm.default_entry_names, acm.default_entry_values))
+        return bool(d.get(a, False) or d.get(b, False))
+
+    def _acm_value(self, acm, a, b):
+        names = list(acm.entry_names)
+        if a in names and b in names:
+            return bool(acm.entry_values[names.index(a)].enabled[names.index(b)])
+        return None
+
+    def _known_names(self):
+        names = set(self.robot_links()) | set(self.all_objects())
+        try:
+            names |= set(self.io.world_names()) | set(self.io.attached_names())
+        except Exception:
+            pass
+        return names
+
+    def acm_get(self, names=None):
+        acm = self.io.get_acm()
+        pick = set(names) if names else None
+        entries = []
+        all_names = list(acm.entry_names)
+        for i, a in enumerate(all_names):
+            for j in range(i + 1, len(all_names)):
+                b = all_names[j]
+                if pick is not None and not (a in pick or b in pick):
+                    continue
+                if acm.entry_values[i].enabled[j]:
+                    key = self._pair_key(a, b)
+                    entries.append({"a": a, "b": b, "allowed": True, "client": key in self.acm_entries})
+        return {"entries": entries, "client_entries": list(self.acm_entries.values()),
+                "default_entries": dict(zip(acm.default_entry_names, acm.default_entry_values)),
+                "scene_version": self.version}
+
+    def acm_set(self, entries, motion_lock, if_version=None, lock_timeout_s=5.0):
+        if not isinstance(entries, list) or not entries:
+            raise _err(400, "bad_request", "entries must be a non-empty list", "entries")
+        known = self._known_names()
+        parsed = []
+        for i, e in enumerate(entries):
+            if not isinstance(e, dict) or not isinstance(e.get("a"), str) or not isinstance(e.get("b"), str):
+                raise _err(400, "bad_request", "entry needs string a, b and bool allowed", f"entries[{i}]")
+            if e["a"] == e["b"]:
+                raise _err(400, "bad_request", "a and b must differ", f"entries[{i}]")
+            for k in ("a", "b"):
+                if e[k] not in known:
+                    raise _err(404, "unknown_object", f"{e[k]!r} is neither a robot link nor a scene object", f"entries[{i}].{k}")
+            if not isinstance(e.get("allowed"), bool):
+                raise _err(400, "bad_request", "allowed must be true/false", f"entries[{i}].allowed")
+            parsed.append(e)
+        if not motion_lock.acquire(timeout=lock_timeout_s):
+            raise _err(409, "busy", "robot is busy (motion in progress); scene not changed")
+        try:
+            with self._lock:
+                if if_version is not None and if_version != self.version:
+                    raise _err(409, "version_conflict", f"scene_version is {self.version}", scene_version=self.version)
+                cur = self.io.get_acm()
+                new_entries = dict(self.acm_entries)
+                for e in parsed:
+                    key = self._pair_key(e["a"], e["b"])
+                    a, b = sorted((e["a"], e["b"]))
+                    original = new_entries[key]["original"] if key in new_entries else self._acm_value(cur, a, b)
+                    new_entries[key] = {"a": a, "b": b, "allowed": e["allowed"], "original": original}
+                msg = self._acm_msg_with(new_entries)
+                self._apply_and_confirm([], set(), set(), acm=msg)
+                after = self.io.get_acm()
+                wrong = [k for k, e in new_entries.items() if self._acm_value(after, e["a"], e["b"]) != e["allowed"]]
+                if wrong:
+                    raise _err(504, "apply_unconfirmed", "ACM read-back does not match", pairs=wrong[:20])
+                self.acm_entries = new_entries
+                self.version += 1
+                self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                self.save()
+                return {"entries": list(new_entries.values()), "scene_version": self.version,
+                        "scene_hash": self.scene_hash()}
+        finally:
+            motion_lock.release()
+
+    def _acm_restore_map(self, keys):
+        """Entries that put the given client entries back to their original
+        value (no explicit entry before -> the default-entry value)."""
+        cur = self.io.get_acm()
+        out = {}
+        for k in keys:
+            e = self.acm_entries[k]
+            orig = e["original"]
+            out[k] = dict(e, allowed=bool(orig) if orig is not None else self._default_allowed(cur, e["a"], e["b"]))
+        return out
+
+    def acm_delete(self, motion_lock, namespace=None, if_version=None, lock_timeout_s=5.0):
+        """Restore the original value of client-written entries (all, or those
+        touching an object in ``namespace``)."""
+        if namespace is not None:
+            self.check_namespace(namespace)
+        if not motion_lock.acquire(timeout=lock_timeout_s):
+            raise _err(409, "busy", "robot is busy (motion in progress); scene not changed")
+        try:
+            with self._lock:
+                if if_version is not None and if_version != self.version:
+                    raise _err(409, "version_conflict", f"scene_version is {self.version}", scene_version=self.version)
+                keys = [k for k, e in self.acm_entries.items()
+                        if namespace is None or in_namespace(e["a"], namespace) or in_namespace(e["b"], namespace)]
+                if keys:
+                    msg = self._acm_msg_with(self._acm_restore_map(keys))
+                    self._apply_and_confirm([], set(), set(), acm=msg)
+                    for k in keys:
+                        self.acm_entries.pop(k)
+                    self.version += 1
+                    self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    self.save()
+                return {"removed": keys, "scene_version": self.version, "scene_hash": self.scene_hash()}
+        finally:
+            motion_lock.release()
+
+    def _acm_for_removed(self, removed_ids):
+        """(acm msg or None, keys to forget) when objects disappear: drop their
+        client entries and their rows in the ACM (MoveIt does not clean up)."""
+        removed = set(removed_ids)
+        if not removed:
+            return None, []
+        keys = [k for k, e in self.acm_entries.items() if e["a"] in removed or e["b"] in removed]
+        names = set(self.io.get_acm().entry_names)
+        if not keys and not (names & removed):
+            return None, []
+        keep = {k: e for k, e in self.acm_entries.items() if k not in keys}
+        return self._acm_msg_with(keep, drop_names=removed), keys
+
+    # ---- padding ----
+
+    def _padding_map(self, pad):
+        links = self.robot_links()
+        return {l: float(pad.get("links", {}).get(l, pad["default_m"])) for l in links}
+
+    def padding_set(self, default_m, links, motion_lock, if_version=None, lock_timeout_s=5.0):
+        robot_links = set(self.robot_links())
+        dv = _num(default_m, "default_m")
+        if not (0.0 <= dv <= 0.1):
+            raise _err(400, "bad_request", "default_m must be in 0..0.1", "default_m")
+        links = links or {}
+        if not isinstance(links, dict):
+            raise _err(400, "bad_request", "links must be {link: metres}", "links")
+        clean = {}
+        for k, v in links.items():
+            if k not in robot_links:
+                raise _err(404, "unknown_object", f"{k!r} is not a robot link", f"links.{k}")
+            v = _num(v, f"links.{k}")
+            if not (0.0 <= v <= 0.1):
+                raise _err(400, "bad_request", "padding must be in 0..0.1 m", f"links.{k}")
+            clean[k] = v
+        pad = {"default_m": dv, "links": clean}
+        if not motion_lock.acquire(timeout=lock_timeout_s):
+            raise _err(409, "busy", "robot is busy (motion in progress); scene not changed")
+        try:
+            with self._lock:
+                if if_version is not None and if_version != self.version:
+                    raise _err(409, "version_conflict", f"scene_version is {self.version}", scene_version=self.version)
+                want = self._padding_map(pad)
+                self._apply_and_confirm([], set(), set(), padding=want)
+                got = self.io.get_padding()
+                wrong = [l for l, v in want.items() if abs(got.get(l, -1) - v) > 1e-9]
+                if wrong:
+                    raise _err(504, "apply_unconfirmed", "link padding read-back does not match", links=wrong[:20])
+                self.padding = None if (dv == 0 and not any(clean.values())) else pad
+                self.version += 1
+                self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                self.save()
+                return {"padding": pad, "applied": want, "scene_version": self.version, "scene_hash": self.scene_hash()}
+        finally:
+            motion_lock.release()
+
+    # ---- attach / detach (v2 objects; legacy objects go through the same diff) ----
+
+    def attach(self, oid, link, touch_links, motion_lock, lock_timeout_s=5.0):
+        if link not in set(self.robot_links()):
+            raise _err(400, "bad_request", f"{link!r} is not a robot link", "link")
+        touch = list(touch_links) if touch_links else [link, "panda_leftfinger", "panda_rightfinger", "panda_hand_tcp"]
+        bad = [t for t in touch if t not in set(self.robot_links())]
+        if bad:
+            raise _err(400, "bad_request", f"touch_links not robot links: {bad}", "touch_links")
+        if not motion_lock.acquire(timeout=lock_timeout_s):
+            raise _err(409, "busy", "robot is busy (motion in progress); scene not changed")
+        try:
+            with self._lock:
+                o = self.objects.get(oid)
+                if o is None:
+                    raise _err(404, "unknown_object", f"no /scene/batch object {oid!r}")
+                if o.get("attached_link"):
+                    raise _err(409, "object_attached", f"{oid!r} is already attached to {o['attached_link']}")
+                self._apply_and_confirm([("attach", oid, {"link": link, "touch_links": touch})],
+                                        set(), {oid}, expect_attached={oid})
+                o["attached_link"], o["touch_links"] = link, touch     # only after MoveIt confirmed it
+                self.version += 1
+                self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                self.save()
+                return {"id": oid, "attached_link": link, "touch_links": touch, "confirmed": True,
+                        "scene_version": self.version, "scene_hash": self.scene_hash()}
+        finally:
+            motion_lock.release()
+
+    def detach(self, oid, motion_lock, lock_timeout_s=5.0):
+        if not motion_lock.acquire(timeout=lock_timeout_s):
+            raise _err(409, "busy", "robot is busy (motion in progress); scene not changed")
+        try:
+            with self._lock:
+                o = self.objects.get(oid)
+                if o is None:
+                    raise _err(404, "unknown_object", f"no /scene/batch object {oid!r}")
+                if not o.get("attached_link"):
+                    raise _err(409, "bad_request", f"{oid!r} is not attached")
+                self._apply_and_confirm([("detach", oid, {"link": o["attached_link"]})],
+                                        {oid}, set(), expect_detached={oid})
+                pose = self.io.world_poses({oid}).get(oid)      # MoveIt left it where the hand was
+                if pose is not None:
+                    o["pose"] = canon_pose(pose, oid)
+                o["frame_id"] = self.planning_frame
+                o["attached_link"] = None
+                o.pop("touch_links", None)
+                self.version += 1
+                self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                self.save()
+                return {"id": oid, "attached_link": None, "pose": o["pose"], "confirmed": True,
+                        "scene_version": self.version, "scene_hash": self.scene_hash()}
+        finally:
+            motion_lock.release()
+
+    def io_attach_existing(self, oid, link, touch_links):
+        """For the legacy SceneManager: version-independent attach via one diff."""
+        self._apply_and_confirm([("attach", oid, {"link": link, "touch_links": touch_links})],
+                                set(), {oid}, expect_attached={oid})
+
+    def io_detach_existing(self, oid, link):
+        self._apply_and_confirm([("detach", oid, {"link": link})], {oid}, set(), expect_detached={oid})
+
+    # ---- snapshot ----
+
+    def snapshot(self, namespace=None):
+        objs = self.all_objects()
+        if namespace:
+            objs = {k: v for k, v in objs.items() if in_namespace(k, namespace)}
+        acm = list(self.acm_entries.values())
+        if namespace:
+            acm = [e for e in acm if in_namespace(e["a"], namespace) or in_namespace(e["b"], namespace)]
+        out = {"api_version": API_VERSION, "scene_version": self.version, "scene_hash": self.scene_hash(),
+               "dirty": self.dirty, "dirty_namespaces": sorted(self.dirty_namespaces), "updated_at": self.updated_at,
+               "objects": [{k: v for k, v in o.items() if k != "legacy"} for _, o in sorted(objs.items())],
+               "acm": acm, "padding": self.padding, "wrist_camera": self.builtin_attached}
+        if namespace:
+            out["namespace"] = namespace
+            out["namespace_hash"] = self.namespace_hash(namespace)
+        return out
 
     def bump_for_legacy_change(self):
         """Legacy /scene/objects mutations change the scene hash too."""
@@ -793,11 +1130,56 @@ class MoveItSceneIO:
         ok = bool(self._apply(ps).success)
         return ok and obj_id in self.attached_names()
 
-    def apply(self, ops, mesh_cache):
-        from moveit_msgs.msg import PlanningScene, CollisionObject
+    def get_acm(self):
+        from moveit_msgs.msg import PlanningSceneComponents
+        res = self._get(PlanningSceneComponents(components=PlanningSceneComponents.ALLOWED_COLLISION_MATRIX))
+        return res.scene.allowed_collision_matrix
+
+    def get_padding(self):
+        from moveit_msgs.msg import PlanningSceneComponents
+        res = self._get(PlanningSceneComponents(components=PlanningSceneComponents.LINK_PADDING_AND_SCALING))
+        return {p.link_name: p.padding for p in res.scene.link_padding}
+
+    def world_poses(self, ids):
+        """{id: pose dict} for world objects (object-level pose)."""
+        from moveit_msgs.msg import PlanningSceneComponents
+        res = self._get(PlanningSceneComponents(components=PlanningSceneComponents.WORLD_OBJECT_GEOMETRY))
+        out = {}
+        for co in res.scene.world.collision_objects:
+            if co.id in ids:
+                p = co.pose
+                out[co.id] = {"position": [p.position.x, p.position.y, p.position.z],
+                              "orientation": [p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]}
+        return out
+
+    def apply(self, ops, mesh_cache, acm=None, padding=None):
+        """One PlanningScene diff. ops: ("remove", id, None), ("add", id, obj),
+        ("attach", id, {"link", "touch_links"}) -- attaches the EXISTING world
+        object --, ("detach", id, {"link"}) -- puts it back into the world.
+        acm: a full AllowedCollisionMatrix msg (replaces the scene's ACM);
+        padding: {link: metres}. MoveIt processes robot_state before world,
+        so detach + remove of the same id work in one diff."""
+        from moveit_msgs.msg import PlanningScene, CollisionObject, AttachedCollisionObject, LinkPadding
         ps = PlanningScene(is_diff=True)
         ps.robot_state.is_diff = True
+        if acm is not None:
+            ps.allowed_collision_matrix = acm
+        if padding:
+            ps.link_padding = [LinkPadding(link_name=k, padding=float(v)) for k, v in sorted(padding.items())]
         for op, oid, obj in ops:
+            if not oid:          # an empty id would address ALL objects
+                raise ValueError("refusing scene op with empty id")
+            if op in ("attach", "detach"):
+                aco = AttachedCollisionObject()
+                aco.link_name = obj["link"]
+                aco.object.id = oid
+                if op == "attach":
+                    aco.touch_links = list(obj.get("touch_links") or [obj["link"]])
+                    aco.object.operation = CollisionObject.ADD
+                else:
+                    aco.object.operation = CollisionObject.REMOVE
+                ps.robot_state.attached_collision_objects.append(aco)
+                continue
             if op == "remove":
                 if not oid:      # an empty id REMOVE wipes the whole world
                     raise ValueError("refusing REMOVE with empty id")

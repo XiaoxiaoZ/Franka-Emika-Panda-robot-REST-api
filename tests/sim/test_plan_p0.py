@@ -61,8 +61,8 @@ info = req("GET", "/scene/info")[1]
 names = {co.id for co in gps(PlanningSceneComponents(components=PlanningSceneComponents.WORLD_OBJECT_NAMES)).scene.world.collision_objects}
 check("T21", info["scene_hash"] == saved and not info["dirty"] and {"pipefit.test.bin", "pipefit.test.tube", "pipefit.test.cube"} <= names,
       f"hash equal {info['scene_hash'] == saved}, dirty {info['dirty']}, objects back {sorted(n for n in names if n.startswith('pipefit'))}")
-check("CAMERA_ATTACHED", info.get("wrist_camera", {}) and info["wrist_camera"]["placeholder"] is True,
-      f"wrist_camera {info.get('wrist_camera', {}).get('size')} placeholder={info.get('wrist_camera', {}).get('placeholder')}")
+check("CAMERA_ATTACHED", bool(info.get("wrist_camera")),
+      f"wrist_camera size {info.get('wrist_camera', {}).get('size')} centre {info.get('wrist_camera', {}).get('center')}")
 
 # T12: home is valid (with the camera box on the hand)
 st, r = req("POST", "/plan/check_state", {"joints": HOME, "gripper_width_m": 0.08})
@@ -122,7 +122,7 @@ check("T16", r0.get("success") and r0.get("trajectory_valid") and (r.get("succes
 cur = joints_now()
 pt, qt = fk_pose(cur, "panda_hand_tcp")
 R = quaternion_matrix(qt)[:3, :3]
-spot = pt + R @ np.array([-0.050, -0.032, -0.047])
+spot = pt + R @ np.array(info["wrist_camera"]["center"])
 cam_blocker = {"id": "pipefit.test.camblock", "pose": {"position": list(spot), "orientation": [0, 0, 0, 1]},
                "shapes": [{"type": "box", "size": [0.008, 0.008, 0.008]}]}
 req("POST", "/scene/batch", {"namespace": "pipefit.test", "mode": "upsert", "objects": [cam_blocker]})

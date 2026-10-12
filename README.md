@@ -284,7 +284,16 @@ take the motion lock.
 | `GET /scene/objects?namespace=&geometry=1` | v2 listing (without these params the old format is unchanged) |
 | `DELETE /scene/namespaces/<ns>` | remove a namespace (batch and legacy objects alike); `if_version`, `force_detach` |
 | `POST /plan/check_state` | `{joints:[7] \| use_current, gripper_width_m}` -> `valid`, `contacts [{a, b, depth_m, point}]`, `joint_limit_margin_ok` |
-| `POST /plan/dry_run` | target `pose` / `joints` / `cartesian`; planner `RRTConnect` (ompl), `PTP` / `LIN` (pilz, pipeline set explicitly); returns the trajectory, duration, per-joint travel, final TCP pose, `would_be_rejected {target_near_limit, near_limit, too_large}`, and an interpolated recheck (`max_step_rad` 0.01) `trajectory_valid` + `contacts` |
+| `POST /plan/dry_run` | target `pose` / `joints` / `cartesian`; planner `RRTConnect` (ompl), `PTP` / `LIN` (pilz, pipeline set explicitly); returns the trajectory, duration, per-joint travel, final TCP pose, `would_be_rejected {target_near_limit, near_limit, too_large}`, and an interpolated recheck (`max_step_rad` 0.01) `trajectory_valid` + `contacts`; `plan_id` kept 10 min |
+| `POST /plan/ik` | `{pose, seeds, n_solutions, avoid_collisions, gripper_width_m}` -> distinct configurations from the analytic IK (q7 sweep), each collision-checked, nearest to the first seed first |
+| `POST /plan/check_trajectory` | `{points [[7]] \| [{t, q}] \| plan_id, max_step_rad, gripper_width_m}` -> `valid`, `first_invalid_index`, `first_invalid_t`, `contacts` |
+| `POST /plan/dry_run_sequence` | `{start, gripper_width_m, defaults, steps: [{plan: {...}} \| {gripper_width_m} \| {attach: {id, link, touch_links}} \| {detach: {id}} \| {acm: {entries}}]}`; each step starts where the previous ended, stops at the first failure. attach carries the object in the planning start state; the object's world copy and ACM entries are changed only temporarily under the motion lock and restored in one confirmed diff (failure -> dirty) |
+| `POST /scene/objects/<id>/attach`, `/detach` | one confirmed diff (MoveIt-version independent), state updated only after MoveIt accepted it; detach records where MoveIt put the object; also used for legacy objects |
+| `GET/POST/DELETE /scene/acm` | allowed pairs; `POST {entries:[{a, b, allowed}]}` reads, merges and writes the whole ACM back, remembering each pair's original value; `DELETE ?namespace=` restores them. SRDF/default entries untouched; entries of removed objects are dropped |
+| `GET/POST /scene/padding` | robot-link padding vs world (`{default_m, links}`), persisted |
+| `GET /scene/snapshot?namespace=` | complete canonical scene (geometry, meta, client ACM entries, padding, hashes) |
+| `GET /robot/tf?from=&to=[&joints=]` | nominal FK between two robot links (current or given joints) |
+| `GET /robot/description` | URDF, SRDF (+ sha256), joint limits, groups, links |
 
 Objects: `{"id": "pipefit.<scene_id>.<obj>", "frame_id": "panda_link0", "pose":
 {"position": [x,y,z], "orientation": [qx,qy,qz,qw]}, "shapes": [...]}`; ids match
@@ -295,6 +304,9 @@ length` (axis = shape z, centred), `mesh` `file` (path in `/files`), `scale`,
 optional `sha256`. Quaternions are normalised and made w >= 0; rpy is not accepted.
 Identical content returns `unchanged: true` without bumping the version;
 `if_version` gives optimistic locking; `validate_only: true` checks without committing.
+
+`scene_hash` additionally covers client ACM entries and padding:
+`sha256(json({"objects": [per-object dicts], "acm": [[a, b, allowed], ...] sorted, "padding": {"default_m", "links"} (%.6f strings) | null}))`.
 
 **Hash** (clients can verify `namespace_hash` locally):
 
@@ -326,13 +338,12 @@ def namespace_hash(objects):       # objects as sent (with mesh sha256 filled in
 - *S6*: scene state lives in `state/` (`FRANKA_STATE_DIR`), not in the `/files` store; the old `data/scene.json` is moved there once.
 - No API token (decided 2026-10-11, lab network only).
 
-**Wrist camera**: a box for the D435 + bracket is attached to `panda_hand` at
-startup (namespace `builtin`, cannot be removed through the API). The default
-size/offset is a PLACEHOLDER derived from the hand-eye calibration (TCP frame:
-size 0.045 x 0.12 x 0.05 m, centre (-0.031, -0.032, -0.047)); set
-`FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz"` once measured, or
-`FRANKA_WRIST_CAMERA=0` to disable. `/scene/info` reports `placeholder: true`
-until configured.
+**Wrist camera**: Intel's own D435 collision box (realsense2_description,
+25.05 x 90 x 25 mm) + 2 mm per side is attached to `panda_hand` at startup
+(namespace `builtin`, cannot be removed through the API), placed by pipeFit's
+hand-eye calibration: TCP frame size 0.029 x 0.094 x 0.029 m, centre
+(-0.031, 0.0005, -0.0435). The bracket is not modelled yet. Override with
+`FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz"` or disable with `FRANKA_WRIST_CAMERA=0`.
 
 ## File store (`/files`)
 

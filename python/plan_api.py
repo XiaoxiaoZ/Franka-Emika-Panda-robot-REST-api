@@ -17,6 +17,8 @@ import math
 import threading
 import time
 
+import numpy as np
+
 from flask import Blueprint, jsonify, request
 
 from scene_core import SceneError, canon_pose
@@ -35,9 +37,13 @@ PLANNERS = {"RRTConnect": "ompl", "PTP": "pilz_industrial_motion_planner", "LIN"
 TARGET_LIMIT_MARGIN_RAD = 0.02
 
 
-def init(robot, core):
+_motion_lock = [None]
+
+
+def init(robot, core, motion_lock=None):
     global _robot, _core
     _robot, _core = robot, core
+    _motion_lock[0] = motion_lock
 
 
 @bp.errorhandler(SceneError)
@@ -277,28 +283,21 @@ def _fk(q, link="panda_hand_tcp"):
             "orientation": [p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]}
 
 
-@bp.route("/plan/dry_run", methods=["POST"])
-def dry_run():
-    """Plan only -- never executes. JSON: target {type: "pose", link
-    (panda_hand_tcp), pose:{frame_id, position, orientation}} | {type:
-    "joints", joints:[7]} | {type: "cartesian", waypoints:[pose...],
-    eef_step_m (0.005)}; planner RRTConnect | PTP | LIN (pipeline set
-    explicitly); start "current" | {joints:[7]}; gripper_width_m;
-    velocity_scaling (0.2); acceleration_scaling (0.05);
-    allowed_planning_time_s (5); attempts (3); max_step_rad (0.01, for
-    the interpolated collision recheck); expect_scene_version. Pose
-    targets for RRTConnect/PTP are converted to joints with the same
-    nearest analytic-IK choice real motions use. Returns success,
-    error_code, trajectory {joint_names, points [{t, q}]}, duration_s,
-    joint_travel_deg, final_tcp_pose, would_be_rejected {target_near_limit,
-    near_limit, too_large}, trajectory_valid + contacts (interpolated
-    recheck), plan_id (kept 10 min). No motion lock."""
+def _start_state(d, width):
+    start = d.get("start", "current")
+    if start == "current":
+        return _state(None, width)
+    if isinstance(start, dict):
+        return _state(_joints7(start.get("joints"), "start.joints"), width)
+    raise _err(400, "bad_request", 'start must be "current" or {joints:[7]}', "start")
+
+
+def _plan(d, start_state, t0):
+    """Plan one target from ``start_state`` (a diff RobotState). Returns the
+    response dict (success, trajectory, checks ...). Never executes."""
     from moveit_msgs.msg import MotionPlanRequest, RobotState
     from moveit_msgs.srv import GetMotionPlan, GetCartesianPath, GetCartesianPathRequest
     from franka import decode_moveit_error, check_trajectory_for_limits, trajectory_joint_travel
-    t0 = time.time()
-    d = _body()
-    _check_scene_version(d)
     planner = d.get("planner", "RRTConnect")
     if planner not in PLANNERS:
         raise _err(400, "bad_request", f"planner must be one of {list(PLANNERS)}", "planner")
@@ -312,14 +311,6 @@ def dry_run():
     max_step = float(d.get("max_step_rad", 0.01))
     if not (0.001 <= max_step <= 0.1):
         raise _err(400, "bad_request", "max_step_rad must be in 0.001..0.1")
-    width = _width(d)
-    start = d.get("start", "current")
-    if start == "current":
-        start_state = _state(None, width)
-    elif isinstance(start, dict):
-        start_state = _state(_joints7(start.get("joints"), "start.joints"), width)
-    else:
-        raise _err(400, "bad_request", 'start must be "current" or {joints:[7]}', "start")
     start_q = _arm_of(start_state)
     target = d.get("target")
     if not isinstance(target, dict) or target.get("type") not in ("pose", "joints", "cartesian"):
@@ -332,7 +323,7 @@ def dry_run():
     start_valid, start_contacts = _validity(start_state)
     if not start_valid:
         resp.update(success=False, error_code="START_STATE_IN_COLLISION", start_contacts=start_contacts)
-        return jsonify(resp), 200
+        return resp
 
     goal_q = None
     if ttype == "joints":
@@ -349,7 +340,7 @@ def dry_run():
             if goal_q is None:
                 resp.update(success=False, error_code="NO_IK_SOLUTION" if n_sols == 0 else "GOAL_IN_COLLISION",
                             ik_solutions_found=n_sols)
-                return jsonify(resp), 200
+                return resp
     if goal_q is not None:
         resp["goal_joints"] = goal_q
         resp["would_be_rejected"] = {"target_near_limit": not _limit_margin_ok(goal_q)}
@@ -362,7 +353,7 @@ def dry_run():
         g_valid, g_contacts = _validity(gs)
         if not g_valid:
             resp.update(success=False, error_code="GOAL_IN_COLLISION", goal_contacts=g_contacts)
-            return jsonify(resp), 200
+            return resp
 
     fraction = None
     if ttype == "cartesian":
@@ -411,7 +402,7 @@ def dry_run():
     pts = traj.joint_trajectory.points if ok else []
     if not ok:
         resp["elapsed_ms"] = int((time.time() - t0) * 1000)
-        return jsonify(resp), 200
+        return resp
 
     jn = list(traj.joint_trajectory.joint_names)
     order = [jn.index(n) for n in ARM_JOINTS]
@@ -435,6 +426,12 @@ def dry_run():
     resp.update(trajectory_valid=valid, contacts=contacts, interpolated_states_checked=checked)
     if not valid:
         resp["first_invalid_segment"] = bad_seg
+    resp["end_joints"] = path[-1] if path else start_q
+    resp["elapsed_ms"] = int((time.time() - t0) * 1000)
+    return resp
+
+
+def _remember_plan(resp, start_q):
     with _plans_lock:
         now = time.time()
         for k in [k for k, (exp, _) in _plans.items() if exp < now]:
@@ -442,7 +439,319 @@ def dry_run():
         _plan_seq[0] += 1
         pid = f"p-{_plan_seq[0]:06d}"
         _plans[pid] = (now + PLAN_TTL_S, {"scene_version": _core.version, "start_joints": start_q,
-                                          "points": path, "planner": planner})
-    resp["plan_id"] = pid
-    resp["elapsed_ms"] = int((time.time() - t0) * 1000)
+                                          "points": [p["q"] for p in resp["trajectory"]["points"]],
+                                          "planner": resp["planner"]})
+    return pid
+
+
+@bp.route("/plan/dry_run", methods=["POST"])
+def dry_run():
+    """Plan only -- never executes. JSON: target {type: "pose", link
+    (panda_hand_tcp), pose:{frame_id, position, orientation}} | {type:
+    "joints", joints:[7]} | {type: "cartesian", waypoints:[pose...],
+    eef_step_m (0.005)}; planner RRTConnect | PTP | LIN (pipeline set
+    explicitly); start "current" | {joints:[7]}; gripper_width_m;
+    velocity_scaling (0.2); acceleration_scaling (0.05);
+    allowed_planning_time_s (5); attempts (3); max_step_rad (0.01, for
+    the interpolated collision recheck); expect_scene_version. Pose
+    targets for RRTConnect/PTP are converted to joints with the same
+    nearest analytic-IK choice real motions use. Returns success,
+    error_code, trajectory {joint_names, points [{t, q}]}, duration_s,
+    joint_travel_deg, final_tcp_pose, would_be_rejected {target_near_limit,
+    near_limit, too_large}, trajectory_valid + contacts (interpolated
+    recheck), plan_id (kept 10 min). No motion lock."""
+    t0 = time.time()
+    d = _body()
+    _check_scene_version(d)
+    start_state = _start_state(d, _width(d))
+    resp = _plan(d, start_state, t0)
+    if resp.get("success") and resp.get("trajectory"):
+        resp["plan_id"] = _remember_plan(resp, resp["start_joints"])
     return jsonify(resp), 200
+
+
+# ------------------------------------------------------------------ ik ----
+
+@bp.route("/plan/ik", methods=["POST"])
+def plan_ik():
+    """Inverse kinematics + reachability, no motion. JSON: pose {frame_id,
+    position, orientation} of panda_hand_tcp, seeds [[7]] (default: the
+    current joints), n_solutions (4), avoid_collisions (true: collision-free
+    solutions first), gripper_width_m. Uses the analytic Panda IK swept over
+    the redundant q7, so it returns DISTINCT configurations (not one
+    numerical solution), each collision-checked against the current scene:
+    {solutions:[{q, valid, contacts, min_limit_margin_rad, cost}], reachable,
+    analytic_solutions}. Ordered by closeness to the first seed (base/elbow
+    weighted, like real motions)."""
+    import panda_ik
+    from tf.transformations import quaternion_matrix
+    d = _body()
+    _check_scene_version(d)
+    pd = d.get("pose") or {}
+    if (pd.get("frame_id") or "panda_link0") not in ("panda_link0", _robot.move_group.get_planning_frame()):
+        raise _err(400, "bad_frame", "pose.frame_id must be panda_link0", "pose.frame_id")
+    if d.get("link", "panda_hand_tcp") != "panda_hand_tcp":
+        raise _err(400, "bad_request", "only link panda_hand_tcp is supported", "link")
+    pose = canon_pose({k: v for k, v in pd.items() if k != "frame_id"}, "pose")
+    n = int(d.get("n_solutions", 4))
+    if not (1 <= n <= 32):
+        raise _err(400, "bad_request", "n_solutions must be 1..32", "n_solutions")
+    width = _width(d)
+    base_state = _state(None, width)
+    seeds = d.get("seeds") or [_arm_of(base_state)]
+    seeds = [_joints7(sd, f"seeds[{i}]") for i, sd in enumerate(seeds)]
+    T = quaternion_matrix(pose["orientation"])
+    T[:3, 3] = pose["position"]
+    cands = []
+    for sd in seeds:
+        cands += panda_ik.solutions_near(T, sd, weights=_robot.IK_JOINT_WEIGHTS,
+                                         limit_margin=_robot.IK_LIMIT_MARGIN_RAD)
+    # rank by closeness to the FIRST seed, then keep only distinct configurations
+    w = np.array(_robot.IK_JOINT_WEIGHTS)
+    s0 = np.array(seeds[0])
+    cands.sort(key=lambda c: float(np.max(w * np.abs(np.array(c[1]) - s0))))
+    picked = []
+    for _, q in cands:
+        if all(np.max(np.abs(np.array(q) - np.array(p))) > 0.2 for p in picked):
+            picked.append(q)
+        if len(picked) >= max(n * 3, 12):
+            break
+    from franka import PANDA_JOINT_LIMITS
+    out = []
+    for q in picked:
+        st = copy.deepcopy(base_state)
+        names = list(st.joint_state.name)
+        pos = list(st.joint_state.position)
+        for jn, v in zip(ARM_JOINTS, q):
+            pos[names.index(jn)] = v
+        st.joint_state.position = pos
+        valid, contacts = _validity(st)
+        margin = min(min(v - lo, hi - v) for v, (lo, hi) in zip(q, PANDA_JOINT_LIMITS))
+        out.append({"q": q, "valid": valid, "contacts": contacts, "min_limit_margin_rad": margin,
+                    "cost": float(np.max(w * np.abs(np.array(q) - s0)))})
+    if d.get("avoid_collisions", True):
+        out.sort(key=lambda o: (not o["valid"], o["cost"]))
+    out = out[:n]
+    return jsonify({"solutions": out, "reachable": any(o["valid"] for o in out),
+                    "analytic_solutions": len(cands), "scene_version": _core.version}), 200
+
+
+# ------------------------------------------------------- check_trajectory ----
+
+@bp.route("/plan/check_trajectory", methods=["POST"])
+def check_trajectory():
+    """Densify a joint trajectory (max_step_rad, default 0.01) and
+    collision-check every sample against the current scene; no motion, no
+    lock. JSON: points [[7]] or [{t, q}] (optionally joint_names to reorder)
+    or plan_id from /plan/dry_run; gripper_width_m. Returns valid,
+    first_invalid_index (segment start), first_invalid_t, contacts,
+    states_checked, scene_version."""
+    d = _body()
+    _check_scene_version(d)
+    max_step = float(d.get("max_step_rad", 0.01))
+    if not (0.001 <= max_step <= 0.1):
+        raise _err(400, "bad_request", "max_step_rad must be in 0.001..0.1", "max_step_rad")
+    times = None
+    if d.get("plan_id"):
+        with _plans_lock:
+            rec = _plans.get(d["plan_id"])
+        if rec is None or rec[0] < time.time():
+            raise _err(404, "unknown_plan", "plan_id unknown or expired (plans are kept 10 min)", "plan_id")
+        pts = rec[1]["points"]
+    else:
+        raw = d.get("points")
+        if not isinstance(raw, list) or not raw:
+            raise _err(400, "bad_request", "points must be a non-empty list", "points")
+        order = None
+        if d.get("joint_names"):
+            jn = list(d["joint_names"])
+            if sorted(jn) != sorted(ARM_JOINTS):
+                raise _err(400, "bad_request", "joint_names must be panda_joint1..7", "joint_names")
+            order = [jn.index(n) for n in ARM_JOINTS]
+        pts, times = [], []
+        for i, p in enumerate(raw):
+            q = p.get("q") if isinstance(p, dict) else p
+            q = _joints7(q, f"points[{i}]")
+            pts.append([q[k] for k in order] if order else q)
+            times.append(p.get("t") if isinstance(p, dict) else None)
+    st = _state(pts[0], _width(d))
+    valid, k, contacts, checked = _interp_check(pts, st, max_step)
+    return jsonify({"valid": valid, "first_invalid_index": k,
+                    "first_invalid_t": (times[k] if times and k is not None else None),
+                    "contacts": contacts, "states_checked": checked, "points": len(pts),
+                    "scene_version": _core.version}), 200
+
+
+# ------------------------------------------------------ dry_run_sequence ----
+
+def _T(p):
+    from tf.transformations import quaternion_matrix
+    T = quaternion_matrix(p["orientation"])
+    T[:3, 3] = p["position"]
+    return T
+
+
+def _pose_of(T):
+    from tf.transformations import quaternion_from_matrix
+    q = quaternion_from_matrix(T)
+    if q[3] < 0:
+        q = -q
+    return {"position": [float(v) for v in T[:3, 3]], "orientation": [float(v) for v in q]}
+
+
+def _virtual_state(q, width, attached):
+    """Diff RobotState at joints q with virtually attached objects (full
+    geometry, pose relative to the link) -- nothing is written to the scene."""
+    from moveit_msgs.msg import AttachedCollisionObject
+    st = _state(q, width)
+    for oid, a in attached.items():
+        co = _core.io.collision_object(a["obj"], _core._mesh_cache)
+        co.header.frame_id = a["link"]
+        co.pose = _core.io._pose_msg(a["rel"])
+        st.attached_collision_objects.append(
+            AttachedCollisionObject(link_name=a["link"], object=co, touch_links=a["touch_links"]))
+    return st
+
+
+@bp.route("/plan/dry_run_sequence", methods=["POST"])
+def dry_run_sequence():
+    """Plan a whole pick (pre-grasp -> descend -> close -> attach -> lift)
+    without moving. JSON: {start, gripper_width_m, defaults:{planner,
+    velocity_scaling, ...}, steps:[ {plan: <dry_run body without start>} |
+    {gripper_width_m: w} | {attach: {id, link, touch_links}} | {detach: {id}}
+    | {acm: {entries:[{a, b, allowed}]}} ]}. Each step starts where the
+    previous ended; the first failing step stops the sequence. attach /
+    detach / acm only affect the sequence: the attached object is carried
+    in the planning start state, its world copy and any ACM entries are
+    changed TEMPORARILY in the live scene while the motion lock is held,
+    and everything is restored in one confirmed diff at the end (failure
+    to restore marks the scene dirty). Returns {success, first_failed_step,
+    steps:[...], restored}."""
+    t0 = time.time()
+    d = _body()
+    _check_scene_version(d)
+    steps = d.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise _err(400, "bad_request", "steps must be a non-empty list", "steps")
+    if len(steps) > 20:
+        raise _err(400, "bad_request", "at most 20 steps", "steps")
+    defaults = d.get("defaults") or {}
+    width = _width(d)
+    q = _arm_of(_start_state(d, width))
+    if width is None:
+        width = _robot.hand_group.get_current_joint_values()[0] * 2
+    from tf.transformations import inverse_matrix
+    lock = _core_lock()
+    if not lock.acquire(timeout=5.0):
+        raise _err(409, "busy", "robot is busy (motion in progress)")
+    attached, temp_removed, temp_added, temp_acm = {}, {}, {}, {}
+    acm0 = _core.io.get_acm()
+    results, failed = [], None
+    try:
+        with _core._lock:
+            for i, step in enumerate(steps):
+                path = f"steps[{i}]"
+                if not isinstance(step, dict) or len(step) != 1:
+                    raise _err(400, "bad_request", "each step is an object with exactly one key", path)
+                kind, arg = next(iter(step.items()))
+                r = {"index": i, "kind": kind}
+                if kind == "plan":
+                    if not isinstance(arg, dict):
+                        raise _err(400, "bad_request", "plan step needs a dry_run body", path)
+                    body = dict(defaults, **arg)
+                    res = _plan(body, _virtual_state(q, width, attached), time.time())
+                    wbr = res.get("would_be_rejected") or {}
+                    ok = bool(res.get("success") and res.get("trajectory_valid", True)
+                              and not wbr.get("too_large") and not wbr.get("near_limit")
+                              and not wbr.get("target_near_limit"))
+                    r.update({k: res.get(k) for k in ("success", "error_code", "planner", "pipeline", "duration_s",
+                                                      "joint_travel_deg", "would_be_rejected", "trajectory_valid",
+                                                      "contacts", "fraction", "final_tcp_pose", "goal_contacts",
+                                                      "start_contacts") if k in res})
+                    if res.get("trajectory"):
+                        r["trajectory"] = res["trajectory"]
+                    r["ok"] = ok
+                    if ok:
+                        q = res["end_joints"]
+                elif kind == "gripper_width_m":
+                    width = _width({"w": arg}, "w")
+                    valid, contacts = _validity(_virtual_state(q, width, attached))
+                    r.update(ok=valid, gripper_width_m=width, valid=valid, contacts=contacts)
+                elif kind == "attach":
+                    oid = (arg or {}).get("id")
+                    o = _core.objects.get(oid)
+                    if o is None:
+                        raise _err(404, "unknown_object", f"{oid!r} is not a /scene/batch object", f"{path}.id")
+                    if oid in attached or o.get("attached_link"):
+                        raise _err(409, "object_attached", f"{oid!r} is already attached", f"{path}.id")
+                    link = arg.get("link", "panda_hand")
+                    touch = arg.get("touch_links") or [link, "panda_leftfinger", "panda_rightfinger", "panda_hand_tcp"]
+                    obj_pose = temp_added[oid]["pose"] if oid in temp_added else o["pose"]
+                    T_link = _T(_fk(q, link))
+                    rel = _pose_of(inverse_matrix(T_link) @ _T(obj_pose))
+                    attached[oid] = {"obj": o, "link": link, "touch_links": touch, "rel": rel}
+                    # the world copy goes away while it is "in the hand"
+                    if oid in temp_added:
+                        _core._apply_and_confirm([("remove", oid, None)], set(), {oid})
+                        temp_added.pop(oid)
+                    else:
+                        _core._apply_and_confirm([("remove", oid, None)], set(), {oid})
+                        temp_removed[oid] = o
+                    valid, contacts = _validity(_virtual_state(q, width, attached))
+                    r.update(ok=valid, id=oid, link=link, valid=valid, contacts=contacts)
+                elif kind == "detach":
+                    oid = (arg or {}).get("id")
+                    if oid not in attached:
+                        raise _err(409, "bad_request", f"{oid!r} is not attached in this sequence", f"{path}.id")
+                    a = attached.pop(oid)
+                    placed = dict(a["obj"], pose=_pose_of(_T(_fk(q, a["link"])) @ _T(a["rel"])), attached_link=None)
+                    _core._apply_and_confirm([("add", oid, placed)], {oid}, set())
+                    temp_added[oid] = placed
+                    valid, contacts = _validity(_virtual_state(q, width, attached))
+                    r.update(ok=valid, id=oid, placed_pose=placed["pose"], valid=valid, contacts=contacts)
+                elif kind == "acm":
+                    entries = (arg or {}).get("entries")
+                    if not isinstance(entries, list) or not entries:
+                        raise _err(400, "bad_request", "acm step needs entries", f"{path}.entries")
+                    for j, e in enumerate(entries):
+                        if not isinstance(e, dict) or not all(isinstance(e.get(k), str) for k in ("a", "b")) \
+                                or not isinstance(e.get("allowed"), bool):
+                            raise _err(400, "bad_request", "entry needs a, b, allowed", f"{path}.entries[{j}]")
+                        a_, b_ = sorted((e["a"], e["b"]))
+                        temp_acm[f"{a_}|{b_}"] = {"a": a_, "b": b_, "allowed": e["allowed"]}
+                    merged = dict(_core.acm_entries)
+                    merged.update(temp_acm)
+                    _core._apply_and_confirm([], set(), set(), acm=_core._acm_msg_with(merged))
+                    r.update(ok=True, entries=len(temp_acm))
+                else:
+                    raise _err(400, "bad_request", "step kind must be plan | gripper_width_m | attach | detach | acm", path)
+                r["joints"] = q
+                results.append(r)
+                if not r["ok"]:
+                    failed = i
+                    break
+    finally:
+        restored = True
+        try:
+            ops = [("remove", oid, None) for oid in temp_added]
+            ops += [("add", oid, o) for oid, o in temp_removed.items()]
+            for oid, o in temp_removed.items():
+                if o.get("attached_link"):
+                    ops.append(("attach", oid, {"link": o["attached_link"], "touch_links": o.get("touch_links")}))
+            if ops or temp_acm:
+                present = {oid for oid, o in temp_removed.items() if not o.get("attached_link")}
+                _core._apply_and_confirm(ops, present, set(temp_added) - set(temp_removed),
+                                         acm=acm0 if temp_acm else None)
+        except Exception as e:
+            restored = False
+            _core._mark_dirty(f"dry_run_sequence could not restore the scene: {e}",
+                              {oid.rsplit('.', 1)[0] for oid in list(temp_removed) + list(temp_added)} or {"pipefit"})
+            _core.save()
+        lock.release()
+    return jsonify({"success": failed is None, "first_failed_step": failed, "steps": results,
+                    "restored": restored, "scene_version": _core.version,
+                    "elapsed_ms": int((time.time() - t0) * 1000)}), 200
+
+
+def _core_lock():
+    return _motion_lock[0]

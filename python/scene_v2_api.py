@@ -69,10 +69,14 @@ def scene_info():
     info.update({
         "motion_enabled": True,
         "wrist_camera": _core.builtin_attached,
+        "acm_client_entries": len(_core.acm_entries),
+        "padding": _core.padding,
         "limits": {k: v for k, v in _core.limits.items()},
         "shape_types": list(SHAPE_TYPES),
         "mesh_formats": MESH_FORMATS,
-        "hash_spec": "per object sorted by id: {id, frame_id, pose:{position:[%.6f x3], "
+        "hash_spec": "scene_hash = sha256 of {objects: [per-object dicts], acm: [[a,b,allowed]...] sorted "
+                     "(client entries), padding: {default_m, links} (%.6f strings) | null}; namespace_hash = "
+                     "sha256 of the per-object list only. Per object, sorted by id: {id, frame_id, pose:{position:[%.6f x3], "
                      "orientation:[%.9f x4, normalised, w>=0]}, attached_link, shapes:[{type, "
                      "dims:[%.6f...] (box [x,y,z], sphere [r], cylinder [r,length], mesh [scale]), "
                      "pose, mesh_sha256|null}]}; numbers as strings, '-0.0..' without sign; "
@@ -118,6 +122,81 @@ def scene_delete_namespace(ns):
 @bp.route("/scene/namespaces/", methods=["DELETE"])
 def scene_delete_namespace_empty():
     raise SceneError(400, "bad_request", "namespace must not be empty")
+
+
+def _int_arg(name):
+    v = request.args.get(name)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        raise SceneError(400, "bad_request", f"{name} must be an integer")
+
+
+@bp.route("/scene/acm", methods=["GET"])
+def scene_acm_get():
+    """Allowed-collision matrix: allowed pairs (names=a,b,... to filter to
+    pairs touching those names), which of them API clients wrote, and the
+    default entries."""
+    names = [n for n in request.args.get("names", "").split(",") if n]
+    with _core._lock:
+        return jsonify(_core.acm_get(names or None)), 200
+
+
+@bp.route("/scene/acm", methods=["POST"])
+def scene_acm_post():
+    """Write ACM entries: {entries:[{a, b, allowed}], if_version}. a/b are
+    robot links or scene objects. The scene's ACM is read, merged and
+    written back whole (a diff with an ACM replaces it) in one confirmed
+    diff; the original value of every pair is remembered so DELETE can
+    restore it. Entries of removed objects are dropped automatically."""
+    d = _json_body()
+    if not isinstance(d, dict):
+        raise SceneError(400, "bad_request", "body must be a JSON object")
+    return jsonify(_core.acm_set(d.get("entries"), _lock, if_version=d.get("if_version"))), 200
+
+
+@bp.route("/scene/acm", methods=["DELETE"])
+def scene_acm_delete():
+    """Restore the original value of client-written ACM entries: all of them,
+    or (namespace=<ns>) only those touching objects of that namespace.
+    SRDF/default entries are never touched."""
+    ns = request.args.get("namespace") or None
+    return jsonify(_core.acm_delete(_lock, namespace=ns, if_version=_int_arg("if_version"))), 200
+
+
+@bp.route("/scene/padding", methods=["GET"])
+def scene_padding_get():
+    """Robot link padding: the configured {default_m, links} and the values
+    move_group currently uses."""
+    return jsonify({"padding": _core.padding, "applied": _core.io.get_padding(),
+                    "scene_version": _core.version}), 200
+
+
+@bp.route("/scene/padding", methods=["POST"])
+def scene_padding_post():
+    """Set robot link padding (robot vs world only; self-collision is not
+    padded): {default_m: 0.01, links: {"panda_leftfinger": 0.003, ...},
+    if_version}. 0..0.1 m. Persisted and re-applied after a restart.
+    Objects are NOT padded here -- inflate them in the geometry you push."""
+    d = _json_body()
+    if not isinstance(d, dict) or "default_m" not in d:
+        raise SceneError(400, "bad_request", "body needs default_m")
+    return jsonify(_core.padding_set(d["default_m"], d.get("links"), _lock,
+                                     if_version=d.get("if_version"))), 200
+
+
+@bp.route("/scene/snapshot", methods=["GET"])
+def scene_snapshot():
+    """Canonical, complete scene for reproduction: every object with full
+    geometry and meta, client ACM entries, padding, versions and hashes
+    (namespace=<ns> to restrict, adds namespace_hash)."""
+    ns = request.args.get("namespace") or None
+    if ns:
+        _core.check_namespace(ns)
+    with _core._lock:
+        return jsonify(_core.snapshot(ns)), 200
 
 
 # ---- test hooks (only with FRANKA_TEST_HOOKS=1; never in production) ----

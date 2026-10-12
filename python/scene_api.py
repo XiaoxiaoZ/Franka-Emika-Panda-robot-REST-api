@@ -51,6 +51,11 @@ def _flag(data, key, default=False):
     return str(v) not in ("0", "false", "no", "")
 
 
+def _v2_core():
+    import scene_v2_api
+    return scene_v2_api.core()
+
+
 class _Locked:
     def __enter__(self):
         if _lock is not None and not _lock.acquire(timeout=5.0):
@@ -189,6 +194,10 @@ def objects_attach(name):
     the gripper and is collision-checked as part of it. JSON: link,
     touch_links (links allowed to touch it; default hand + fingers)."""
     d = _body()
+    core = _v2_core()
+    if core is not None and name in core.objects:      # /scene/batch object: one confirmed diff
+        return jsonify({"status": "attached", **core.attach(name, d.get("link", "panda_hand"),
+                                                            d.get("touch_links"), _lock)}), 200
     with _Locked():
         info = _manager.attach(name, link=d.get("link", "panda_hand"), touch_links=d.get("touch_links"))
     return jsonify({"status": "attached", **info}), 200
@@ -197,6 +206,9 @@ def objects_attach(name):
 @bp.route("/scene/objects/<name>/detach", methods=["POST"])
 def objects_detach(name):
     """Detach the object from the robot; it stays in the world where it is."""
+    core = _v2_core()
+    if core is not None and name in core.objects:      # /scene/batch object: one confirmed diff
+        return jsonify({"status": "detached", **core.detach(name, _lock)}), 200
     with _Locked():
         info = _manager.detach(name)
     return jsonify({"status": "detached", **info}), 200

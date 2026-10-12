@@ -16,6 +16,7 @@ from files_api import bp as files_bp, store as file_store
 import scene_api
 import scene_v2_api
 import plan_api
+import robot_api
 from scene_manager import SceneManager
 from scene_core import SceneCore, MoveItSceneIO
 from payload_id import PayloadIdentifier
@@ -51,6 +52,8 @@ app.register_blueprint(scene_api.bp)
 app.register_blueprint(scene_v2_api.bp)
 # /plan/check_state, /plan/dry_run: plan-only checks, never move the robot.
 app.register_blueprint(plan_api.bp)
+# /robot/tf, /robot/description: read-only model facts for frame checks.
+app.register_blueprint(robot_api.bp)
 
 # Flask debug mode (and its auto-reloader). The reloader re-executes this
 # module in a child process, so module-level singletons are built twice unless
@@ -112,6 +115,10 @@ scene_core = SceneCore(MoveItSceneIO(), file_store, os.path.join(STATE_DIR, "sce
                        logger=rospy.logwarn, legacy=scene_manager)
 scene_manager.on_change = scene_core.bump_for_legacy_change
 scene_manager.is_reserved = lambda name: name in scene_core.objects
+# legacy attach/detach also go through one confirmed diff (MoveIt-version independent)
+scene_manager.attach_fn = scene_core.io_attach_existing
+scene_manager.detach_fn = scene_core.io_detach_existing
+scene_core.robot_links = robot.robot.get_link_names
 _restored_v2 = scene_core.load_and_restore()
 rospy.loginfo("scene v2 restored: %s", _restored_v2)
 
@@ -156,24 +163,31 @@ def _robot_info():
 
 
 scene_v2_api.init(scene_core, moveit_lock, _robot_info)
-plan_api.init(robot, scene_core)
+plan_api.init(robot, scene_core, moveit_lock)
+robot_api.init(robot)
 
-# Wrist camera (D435 + bracket) as a box attached to the hand, so plan-only
-# checks represent the real robot. PLACEHOLDER size/offset (TCP frame, m)
-# derived from the hand-eye calibration (optical centre ~(-0.031,-0.032,
-# -0.035), long axis along TCP y) until the lab measures it; override with
-# FRANKA_WRIST_CAMERA_BOX="sx,sy,sz,cx,cy,cz", disable with FRANKA_WRIST_CAMERA=0.
-_CAM_DEFAULT = (0.045, 0.12, 0.05, -0.031, -0.032, -0.047)
+# Wrist camera (Intel RealSense D435) as a box attached to the hand, so
+# plan-only checks represent the real robot. Geometry = Intel's own D435
+# collision box (realsense2_description _d435.urdf.xacro: 25.05 x 90 x 25 mm,
+# centred (-0.0085, -0.0175, 0) in camera_link) + 2 mm margin per side,
+# placed with pipeFit's hand-eye calibration: colour optical centre at TCP
+# (-0.031, -0.032, -0.035), optical axis = TCP +z, image x = TCP +y. The
+# bracket is NOT modelled yet. Override with FRANKA_WRIST_CAMERA_BOX=
+# "sx,sy,sz,cx,cy,cz" (TCP frame, m), disable with FRANKA_WRIST_CAMERA=0.
+_CAM_DEFAULT = (0.029, 0.094, 0.029, -0.031, 0.0005, -0.0435)
 if os.environ.get("FRANKA_WRIST_CAMERA", "1") != "0":
     _cam_env = os.environ.get("FRANKA_WRIST_CAMERA_BOX")
     _cam = tuple(float(v) for v in _cam_env.split(",")) if _cam_env else _CAM_DEFAULT
     _cam_spec = {"id": "wrist_camera", "link": "panda_hand", "frame": "panda_hand_tcp",
-                 "size": list(_cam[:3]), "center": list(_cam[3:6]), "placeholder": _cam_env is None,
+                 "size": list(_cam[:3]), "center": list(_cam[3:6]), "placeholder": False,
+                 "source": "FRANKA_WRIST_CAMERA_BOX" if _cam_env else
+                           "Intel D435 collision box (+2 mm) placed by pipeFit hand-eye calibration",
+                 "bracket_modelled": False,
                  "touch_links": ["panda_hand", "panda_leftfinger", "panda_rightfinger", "panda_link7"]}
     if scene_core.io.attach_box(_cam_spec["id"], _cam_spec["link"], _cam_spec["frame"], _cam_spec["size"],
                                 _cam_spec["center"], _cam_spec["touch_links"]):
         scene_core.builtin_attached = _cam_spec
-        rospy.loginfo("wrist camera collision box attached (%s)", "PLACEHOLDER size" if _cam_spec["placeholder"] else "configured size")
+        rospy.loginfo("wrist camera collision box attached (%s)", _cam_spec["source"])
     else:
         rospy.logerr("wrist camera collision box could NOT be attached")
 
@@ -284,7 +298,7 @@ def api_help():
             "GET /camera/stream (MJPEG, browser-viewable) for a live view; /camera/color for a still; /camera/start and /camera/stop control the device.",
             "PUT /files/cad/part.stl (raw body) to store a CAD model on the server; GET /files?q=*.stl to find it.",
             "POST /scene/models {name, file, scale} to register it; POST /scene/objects {name, model, x,y,z, yaw} to place it; PUT /scene/objects/sync {source, objects:[...]} from a detector.",
-            "Scene API v2 for whole-scene pushes: GET /scene/info, POST /scene/batch (atomic, primitives + meshes, namespaces), POST /plan/check_state and /plan/dry_run (plan only, never moves).",
+            "Scene API v2 for whole-scene pushes: GET /scene/info, POST /scene/batch (atomic, primitives + meshes, namespaces), /scene/acm, /scene/padding, /scene/snapshot; plan-only: POST /plan/check_state, /plan/dry_run, /plan/ik, /plan/check_trajectory, /plan/dry_run_sequence; GET /robot/tf, /robot/description.",
         ],
         "conventions": {
             "units": "meters, Newtons, N*m, radians; positions are absolute in the robot base frame",
